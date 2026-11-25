@@ -215,6 +215,10 @@ tools/linux_qemu.py runs the Linux image on QEMU's 750
 
 ## Usage
 
+`tools/setup.sh` installs everything on Ubuntu 24.04, builds, and runs the
+whole suite (`--linux` adds the kernel build and boot). `CLAUDE.md` has working
+notes for continuing the project in Claude Code.
+
 Requires `verilator` (5.x), `gcc-powerpc-linux-gnu`, `qemu-user`, `qemu-system-ppc`.
 On Ubuntu: `sudo apt install verilator gcc-powerpc-linux-gnu qemu-user qemu-system-ppc`.
 On macOS: `brew install verilator qemu`; the cross-compiler is easiest via a Linux VM or container.
