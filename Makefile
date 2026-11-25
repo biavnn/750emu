@@ -20,7 +20,7 @@ CFLAGS_LINUX  := $(CFLAGS_COMMON) -static -no-pie
 
 RTL := rtl/ppc_pkg.sv rtl/ppc_fpu.sv rtl/ppc_exec.sv rtl/ppc_mmu.sv rtl/ppc_core.sv rtl/ppc_pipe.sv rtl/soc_top.sv
 
-.PHONY: all sim tests test run clean randtest fprandtest linux-sim linux-test
+.PHONY: all sim tests test run clean randtest fprandtest linux-sim linux-test linux-jitter
 .SECONDARY:
 all: sim tests
 
@@ -32,7 +32,8 @@ VFLAGS := --cc --exe --build -j 0 -O3 -fno-case -Wall -Wno-fatal
 SIM0 := $(BUILD)/sim0/Vsoc_top
 SIM1 := $(BUILD)/sim1/Vsoc_top
 LS   := $(BUILD)/ls/Vlockstep_top
-sim: $(SIM0) $(SIM1) $(LS)
+LSJ  := $(BUILD)/lsj/Vlockstep_top
+sim: $(SIM0) $(SIM1) $(LS) $(LSJ)
 
 define verilate
 	@mkdir -p $(dir $@)
@@ -47,6 +48,9 @@ $(SIM1): $(RTL) sim/tb.cpp
 	$(call verilate,soc_top,-GCORE=1,sim/tb.cpp)
 $(LS): $(RTL) rtl/lockstep_top.sv sim/tb_lockstep.cpp
 	$(call verilate,lockstep_top,,rtl/lockstep_top.sv sim/tb_lockstep.cpp)
+# lockstep again, with pseudo-random wait states on the pipeline's memory buses
+$(LSJ): $(RTL) rtl/lockstep_top.sv sim/tb_lockstep.cpp
+	$(call verilate,lockstep_top,-GBUS_JITTER=1,rtl/lockstep_top.sv sim/tb_lockstep.cpp)
 
 # Linux-capable build of the pipeline: 32 MiB RAM, boots from the stub at 0x01F00000
 LSIM := $(BUILD)/linux/Vsoc_top
@@ -55,11 +59,18 @@ $(LSIM): $(RTL) sim/tb.cpp
 LLS := $(BUILD)/linuxls/Vlockstep_top
 $(LLS): $(RTL) rtl/lockstep_top.sv sim/tb_lockstep.cpp
 	$(call verilate,lockstep_top,-GMEM_BYTES=33554432 -GRESET_PC=32\'h01F00000,rtl/lockstep_top.sv sim/tb_lockstep.cpp)
+LINUX_OUT ?= ../linux-build/out
+LLSJ := $(BUILD)/linuxlsj/Vlockstep_top
+$(LLSJ): $(RTL) rtl/lockstep_top.sv sim/tb_lockstep.cpp
+	$(call verilate,lockstep_top,-GMEM_BYTES=33554432 -GRESET_PC=32\'h01F00000 -GBUS_JITTER=1,rtl/lockstep_top.sv sim/tb_lockstep.cpp)
 linux-sim: $(LSIM) $(LLS)
+
+# The whole Linux boot in lockstep with random bus wait states (slow: several minutes)
+linux-jitter: $(LLSJ)
+	$(LLSJ) +bin=$(LINUX_OUT)/linux-sim.bin +max_cycles=2000000000 > /dev/null
 
 # Boot Linux: QEMU's 750 as reference, then the pipeline, then pipeline vs
 # reference core in lockstep. LINUX_OUT is the output directory of linux/build.sh.
-LINUX_OUT ?= ../linux-build/out
 linux-test: linux-sim
 	tools/linuxtest.sh $(LINUX_OUT) $(LSIM) $(LLS)
 
@@ -107,6 +118,7 @@ test: all
 	@echo "== pipeline vs QEMU";       tools/difftest.sh $(SIM1) $(BUILD)/sw "$(QEMU)" $(TESTS)
 	@echo "== lockstep pipeline vs reference"; tools/lockstep.sh $(LS) $(BUILD)/sw $(TESTS)
 	@echo "== supervisor tests vs QEMU system (750 on 40p) + lockstep"; tools/systest.sh $(BUILD)/sys $(SYSTESTS)
+	@echo "== lockstep with random bus wait states"; tools/lockstep.sh $(LSJ) $(BUILD)/sw $(TESTS) && tools/lockstep.sh $(LSJ) $(BUILD)/sys $(SYSTESTS)
 
 clean:
 	rm -rf $(BUILD)

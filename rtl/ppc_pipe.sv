@@ -1,36 +1,40 @@
-// g3core - phase 1 pipelined core
+// g3core pipelined core
 //
-// Classic 5-stage in-order pipeline:
+// Six stages, in order:
 //
-//   IF   fetch at pc_f, predict pc+4
+//   F1   PC, instruction TLB lookup, fetch request
+//   F2   wait for the fetch response
 //   ID   static branch prediction: b, unconditional bc/bclr/bcctr and
-//        backward bc are predicted taken and redirect fetch from ID
-//   EX   register read + forwarding, ppc_exec, SPR commit, branch resolve
-//   MEM  data memory access
-//   WB   GPR write, retire
+//        backward bc are predicted taken and redirect fetch from here
+//   EX   register read + forwarding, ppc_exec, data TLB lookup, data request,
+//        all architectural state except the register file, branch resolve
+//   MEM  wait for the data response
+//   WB   register file write, retire
+//
+// Memory is reached through two request/response buses (ibus, dbus): a
+// request is accepted in a cycle where gnt is high and its response arrives
+// one or more cycles later with rvalid. One request per bus may be
+// outstanding. This matches block RAM (response the next cycle) and leaves
+// room for caches or a slower bus, which simply delay gnt or rvalid.
 //
 // Design notes
-// - GPRs are read in EX with forwarding from MEM and WB, so the only data
-//   hazard is load-use: the EX instruction waits one cycle when it needs the
-//   result of a load in MEM.
-// - CR/XER/LR/CTR/MSR/SPRs are committed in EX, and every exception that
-//   exists so far (program, sc, FP unavailable, decrementer, external) is
-//   recognised in EX too, so exceptions are precise without any undo logic.
-//   When data-access faults arrive with the MMU, MEM-stage faults will need
-//   these writes to move later or be undone.
+// - The register file is read in EX with forwarding from MEM and WB. A load's
+//   data is not available until WB, so an instruction that needs it waits in
+//   EX while the load is in MEM.
+// - CR/XER/LR/CTR/MSR/SPRs are committed in EX, and every exception is
+//   recognised there, so exceptions are precise without undo logic. A store
+//   is committed when its bus request is accepted.
 // - Time base and decrementer advance once per EX step, matching ppc_core.
-// - MMU: fetch translates in IF. A fetch that misses the TLB or faults is not
-//   acted on speculatively; it travels down the pipe as a marker and is
-//   resolved when it reaches EX (page walk then refetch, or ISI). Data
-//   addresses are translated in EX, so DSI is an EX-stage exception as well.
-//   The walker borrows the data port while EX is stalled. Instructions
-//   that change the translation context (mtmsr, mtsr, BAT/SDR1 writes, tlbie)
-//   flush everything fetched after them.
-// - Correctly predicted taken branches cost 1 cycle (the wrong-path fetch);
-//   mispredictions are fixed in EX and flush IF/ID and ID/EX (2 cycles).
-// - lmw/stmw stay in EX for one micro-op per register; the front end holds.
+// - MMU: a fetch that misses the TLB or faults is not acted on speculatively;
+//   it travels down the pipe as a marker and is resolved when it reaches EX
+//   (page walk then refetch, or ISI). Data addresses are translated in EX.
+//   The walker uses the data bus while EX is stalled and MEM is empty.
+//   Instructions that change the translation context flush younger fetches.
+// - A redirect while a fetch is outstanding marks that fetch as killed; its
+//   response is dropped when it arrives.
+// - Multi-step instructions stay in EX, one step per data request.
 // - The retire trace has exactly the same meaning as ppc_core's, so the two
-//   cores can be compared step by step.
+//   cores can be compared step by step whatever the bus timing.
 
 module ppc_pipe #(
     parameter logic [31:0] RESET_PC = 32'h0000_0100,
@@ -39,14 +43,21 @@ module ppc_pipe #(
     input  logic        clk,
     input  logic        rst,
     input  logic        irq,
-    output logic [31:0] imem_addr,
-    input  logic [31:0] imem_rdata,
-    output logic [31:0] dmem_addr,
-    output logic [1:0]  dmem_size,
-    output logic        dmem_re,
-    output logic        dmem_we,
-    output logic [31:0] dmem_wdata,
-    input  logic [31:0] dmem_rdata,
+    // instruction bus (physical addresses, word reads)
+    output logic        ibus_req,
+    input  logic        ibus_gnt,
+    output logic [31:0] ibus_addr,
+    input  logic        ibus_rvalid,
+    input  logic [31:0] ibus_rdata,
+    // data bus (physical addresses; size 0/1/2 = byte/half/word, data right-aligned)
+    output logic        dbus_req,
+    input  logic        dbus_gnt,
+    output logic [31:0] dbus_addr,
+    output logic [1:0]  dbus_size,
+    output logic        dbus_we,
+    output logic [31:0] dbus_wdata,
+    input  logic        dbus_rvalid,
+    input  logic [31:0] dbus_rdata,
     output logic [63:0] instret,
     output logic [63:0] cycles,
     output logic        tr_valid,
@@ -84,7 +95,15 @@ module ppc_pipe #(
     // ------------------------------------------------------------------
     logic [31:0] pc_f;
 
-    logic        d_valid;  logic [31:0] d_pc, d_insn;            // IF/ID
+    // F2: one fetch in flight or waiting for ID
+    logic        f2_valid;
+    logic        f2_pend;                                         //   response not received yet
+    logic        f2_have;                                         //   response held in f2_insn
+    logic        f2_kill;                                         //   wrong path: drop the response
+    logic        f2_imiss, f2_iflt;
+    logic [31:0] f2_pc, f2_insn, f2_ifbits;
+
+    logic        d_valid;  logic [31:0] d_pc, d_insn;            // F2/ID
     logic        d_imiss, d_iflt; logic [31:0] d_ifbits;          //   fetch marker
     logic        e_valid;  logic [31:0] e_pc, e_insn;            // ID/EX
     logic        e_imiss, e_iflt; logic [31:0] e_ifbits;
@@ -115,9 +134,7 @@ module ppc_pipe #(
     // ------------------------------------------------------------------
     logic [31:0] i_pa, i_fbits, d_pa, d_fbits, wk_addr, wk_wdata, xspr_rdata, sr_rdata;
     logic        i_ok, i_miss, i_flt, d_ok, d_miss, d_flt;
-    logic        wk_start, wk_busy, wk_done, wk_nf, wk_re, wk_we, xspr_valid;
-
-    assign imem_addr = i_pa;
+    logic        wk_start, wk_busy, wk_done, wk_nf, wk_req, wk_we, xspr_valid;
 
     // ------------------------------------------------------------------
     // ID: static branch prediction
@@ -238,20 +255,47 @@ module ppc_pipe #(
     wire mem       = ld | st;
     wire e_dflt    = mem & (d_flt | (d_miss & e_nf_d));
     wire e_dwalk   = mem & d_miss & ~e_nf_d;
+    wire mem_need  = mem & ~e_dflt;               // this step makes a data bus request
     wire base_go   = e_valid && !ld_use;
     wire need_walk = base_go && (e_iwalk | e_dwalk);
-    // The walker becomes busy the cycle after wk_start; EX is stalled by then, so
-    // MEM holds a bubble and the data port is free.
-    assign wk_start = need_walk && !wk_busy;
-    wire ex_go     = base_go && !need_walk;   // one architectural step happens this cycle
+
+    // MEM completes when its response arrives (or at once if it made no request)
+    wire m_memop   = m.valid && (m.ld || m.st);
+    wire m_done    = !m_memop || dbus_rvalid;
+    wire m_free    = !m.valid || m_done;
+
+    // The walker may only start once MEM is empty, so the data bus is idle.
+    assign wk_start = need_walk && !wk_busy && !m.valid;
+    wire ex_try    = base_go && !need_walk && !wk_busy && m_free;
+    wire ex_go     = ex_try && (!mem_need || dbus_gnt);   // one architectural step happens this cycle
     wire dsi       = ex_go && e_dflt;
     wire ex_commit = ex_go && !e_dflt;
     wire [31:0] dec_n = (spr_we && ex_commit && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
-    wire ms_cont   = ex_commit && ms_active_n;                    // lmw/stmw has more steps
+    wire ms_cont   = ex_commit && ms_active_n;                    // multi-step instruction continues
     wire redirect  = ex_go && (dsi || exc || ctx_sync || (retire && next_pc != e_pred_pc));
     wire [31:0] redirect_pc = dsi ? ppc_pkg::exc_vector(msr, 20'h00300) : next_pc;
     wire irefetch  = wk_done && !wk_nf && e_iwalk;                // page now in the ITLB: fetch again
-    wire hold      = ld_use || ms_cont || need_walk;
+    wire hold      = e_valid && (!ex_go || ms_cont);              // EX keeps its instruction
+
+    assign dbus_req   = wk_busy ? wk_req   : (ex_try && mem_need);
+    assign dbus_addr  = wk_busy ? wk_addr  : d_pa;
+    assign dbus_size  = wk_busy ? 2'd2     : msize;
+    assign dbus_we    = wk_busy ? wk_we    : st;
+    assign dbus_wdata = wk_busy ? wk_wdata : st_data;
+
+    // ------------------------------------------------------------------
+    // Front end
+    // ------------------------------------------------------------------
+    wire adv        = !hold && !redirect && !irefetch;            // ID moves to EX
+    wire kill_front = redirect || irefetch || (adv && id_taken);  // everything younger than ID/EX is wrong-path
+    wire f2_resp    = f2_valid && f2_pend && ibus_rvalid;
+    wire f2_ready   = f2_valid && !f2_kill && (!f2_pend || ibus_rvalid);
+    wire f2_take    = adv && !id_taken && f2_ready;               // F2 moves to ID
+    wire [31:0] f2_insn_now = (f2_imiss | f2_iflt) ? 32'd0 : f2_have ? f2_insn : ibus_rdata;
+    wire f1_can     = !kill_front && (!f2_valid || f2_take);
+    assign ibus_req  = f1_can && i_ok;
+    assign ibus_addr = i_pa;
+    wire f1_go      = f1_can && (!i_ok || ibus_gnt);              // fetch issued, or marker created
 
     wire [31:0] d_fbits_x = d_flt ? d_fbits : 32'h4000_0000;
 
@@ -260,7 +304,8 @@ module ppc_pipe #(
         .i_ea(pc_f), .i_pa, .i_ok, .i_miss, .i_flt, .i_fbits,
         .d_ea(ea), .d_store(st), .d_pa, .d_ok, .d_miss, .d_flt, .d_fbits,
         .wk_start, .wk_instr(e_iwalk), .wk_store(st), .wk_ea(e_iwalk ? e_pc : ea),
-        .wk_busy, .wk_done, .wk_nf, .wk_re, .wk_we, .wk_addr, .wk_wdata, .wk_rdata(dmem_rdata),
+        .wk_busy, .wk_done, .wk_nf, .wk_req, .wk_we, .wk_addr, .wk_wdata,
+        .wk_gnt(dbus_gnt), .wk_rvalid(dbus_rvalid), .wk_rdata(dbus_rdata),
         .spr_idx, .spr_rdata(xspr_rdata), .spr_rvalid(xspr_valid),
         .spr_we(spr_we & ex_commit), .spr_wdata(spr_val),
         .sr_idx, .sr_rdata, .sr_we(sr_we & ex_commit), .sr_wdata(e_vs),
@@ -271,13 +316,7 @@ module ppc_pipe #(
     // ------------------------------------------------------------------
     // MEM
     // ------------------------------------------------------------------
-    assign dmem_addr  = wk_busy ? wk_addr  : m.pa;
-    assign dmem_size  = wk_busy ? 2'd2     : m.size;
-    assign dmem_re    = wk_busy ? wk_re    : m.valid && m.ld;
-    assign dmem_we    = wk_busy ? wk_we    : m.valid && m.st;
-    assign dmem_wdata = wk_busy ? wk_wdata : m.st_data;
-
-    wire [31:0] m_ld_val = ppc_pkg::ld_result(dmem_rdata, m.fsize, m.sext, m.brev, m.mrg, m.pos, m.acc, m.rf_val, m.s2d);
+    wire [31:0] m_ld_val = ppc_pkg::ld_result(dbus_rdata, m.fsize, m.sext, m.brev, m.mrg, m.pos, m.acc, m.rf_val, m.s2d);
 
     // ------------------------------------------------------------------
     // WB / trace
@@ -296,6 +335,8 @@ module ppc_pipe #(
     always_ff @(posedge clk) begin
         if (rst) begin
             pc_f <= RESET_PC;
+            f2_valid <= 0; f2_pend <= 0; f2_have <= 0; f2_kill <= 0; f2_imiss <= 0; f2_iflt <= 0;
+            f2_pc <= 0; f2_insn <= 0; f2_ifbits <= 0;
             d_valid <= 0; d_pc <= 0; d_insn <= 0; d_imiss <= 0; d_iflt <= 0; d_ifbits <= 0;
             e_valid <= 0; e_pc <= 0; e_insn <= 0; e_pred_pc <= 0;
             e_imiss <= 0; e_iflt <= 0; e_ifbits <= 0; e_nf_i <= 0; e_nf_d <= 0;
@@ -322,22 +363,25 @@ module ppc_pipe #(
 
             // ---- MEM -> WB ----
             w <= m;
+            w.valid <= m.valid && m_done;
             if (m.ld) w.rf_val <= m_ld_val;
 
             // ---- EX -> MEM ----
-            m.valid   <= ex_go;
-            m.pc      <= e_pc;       m.insn   <= e_insn;
-            m.rf_we   <= (wa_en | ld) & ~dsi;   m.ld <= ld & ~dsi;
-            m.rf_idx  <= wa_idx;     m.rf_val <= wa_val;
-            m.up_we   <= wb_en & ~dsi;  m.up_idx <= e_ra;    m.up_val <= wb_val;
-            m.st      <= st & ~dsi;  m.ea     <= ea;      m.pa <= d_pa;  m.st_data <= st_data;
-            m.size    <= msize;      m.sext   <= ld_sext; m.brev    <= ld_brev;
-            m.mrg     <= ld_mrg;     m.pos    <= ld_pos;  m.acc     <= ld_acc;   m.fsize <= fsize;   m.s2d <= ld_s2d;
-            m.retire  <= retire;
-            m.cr  <= dsi ? cr  : cr_n;   m.xer <= dsi ? xer : xer_n;
-            m.lr  <= dsi ? lr  : lr_n;   m.ctr <= dsi ? ctr : ctr_n;
-            m.msr <= dsi ? ppc_pkg::exc_msr(msr) : msr_n;
-            m.exc <= exc | dsi;
+            if (m_free) begin
+                m.valid   <= ex_go;
+                m.pc      <= e_pc;       m.insn   <= e_insn;
+                m.rf_we   <= (wa_en | ld) & ~dsi;   m.ld <= ld & ~dsi;
+                m.rf_idx  <= wa_idx;     m.rf_val <= wa_val;
+                m.up_we   <= wb_en & ~dsi;  m.up_idx <= e_ra;    m.up_val <= wb_val;
+                m.st      <= st & ~dsi;  m.ea     <= ea;      m.pa <= d_pa;  m.st_data <= st_data;
+                m.size    <= msize;      m.sext   <= ld_sext; m.brev    <= ld_brev;
+                m.mrg     <= ld_mrg;     m.pos    <= ld_pos;  m.acc     <= ld_acc;   m.fsize <= fsize;   m.s2d <= ld_s2d;
+                m.retire  <= retire;
+                m.cr  <= dsi ? cr  : cr_n;   m.xer <= dsi ? xer : xer_n;
+                m.lr  <= dsi ? lr  : lr_n;   m.ctr <= dsi ? ctr : ctr_n;
+                m.msr <= dsi ? ppc_pkg::exc_msr(msr) : msr_n;
+                m.exc <= exc | dsi;
+            end
 
             if (wk_done && wk_nf) begin
                 if (e_iwalk) e_nf_i <= 1; else e_nf_d <= 1;
@@ -376,22 +420,38 @@ module ppc_pipe #(
             end
 
             // ---- front end ----
+            if (f2_resp) begin
+                f2_pend <= 0;
+                if (f2_kill) f2_valid <= 0;
+                else begin f2_have <= 1; f2_insn <= ibus_rdata; end
+            end
+            if (kill_front) begin
+                if (f2_valid && f2_pend && !ibus_rvalid) f2_kill <= 1;    // response still to come
+                else f2_valid <= 0;
+            end
             if (redirect || irefetch) begin
                 pc_f <= redirect ? redirect_pc : e_pc;
                 d_valid <= 0; e_valid <= 0;
-            end else if (!hold) begin
+            end else if (adv) begin
                 e_valid <= d_valid; e_pc <= d_pc; e_insn <= d_insn;
                 e_imiss <= d_imiss; e_iflt <= d_iflt; e_ifbits <= d_ifbits;
                 e_pred_pc <= id_taken ? id_target : d_pc + 32'd4;
                 if (id_taken) begin
-                    pc_f <= id_target;                // drop the sequential fetch
+                    pc_f <= id_target;
                     d_valid <= 0;
+                end else if (f2_ready) begin
+                    d_valid <= 1; d_pc <= f2_pc; d_insn <= f2_insn_now;
+                    d_imiss <= f2_imiss; d_iflt <= f2_iflt; d_ifbits <= f2_ifbits;
+                    f2_valid <= 0;
                 end else begin
-                    // a fetch that cannot be translated yet becomes a marker
-                    d_valid <= 1; d_pc <= pc_f; d_insn <= i_ok ? imem_rdata : 32'd0;
-                    d_imiss <= i_miss; d_iflt <= i_flt; d_ifbits <= i_fbits;
-                    pc_f <= pc_f + 32'd4;
+                    d_valid <= 0;
                 end
+            end
+            if (f1_go) begin
+                // a fetch that cannot be translated yet becomes a marker (no bus request)
+                f2_valid <= 1; f2_pc <= pc_f; f2_pend <= i_ok; f2_have <= 0; f2_kill <= 0;
+                f2_imiss <= i_miss; f2_iflt <= i_flt; f2_ifbits <= i_fbits;
+                pc_f <= pc_f + 32'd4;
             end
         end
     end

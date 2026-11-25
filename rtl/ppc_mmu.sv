@@ -40,8 +40,11 @@ module ppc_mmu #(
     output logic        wk_busy,
     output logic        wk_done,          // last cycle of a walk
     output logic        wk_nf,            // with wk_done: no matching PTE
-    output logic        wk_re, wk_we,
+    // walker memory bus: a request is accepted when wk_gnt is high; its
+    // response (also for writes) arrives one or more cycles later with wk_rvalid
+    output logic        wk_req, wk_we,
     output logic [31:0] wk_addr, wk_wdata,
+    input  logic        wk_gnt, wk_rvalid,
     input  logic [31:0] wk_rdata,
     // special registers
     input  logic [9:0]  spr_idx,
@@ -167,7 +170,8 @@ module ppc_mmu #(
     // ------------------------------------------------------------------
     // Page table walker
     // ------------------------------------------------------------------
-    typedef enum logic [1:0] { W_IDLE, W_PTE0, W_PTE1, W_NF } wstate_t;
+    typedef enum logic [2:0] { W_IDLE, W_REQ0, W_RSP0, W_REQ1, W_RSP1, W_WREQ, W_WRSP, W_NF } wstate_t;
+    logic [31:0] w_wd;
     wstate_t     ws;
     logic [31:0] w_ea;
     logic        w_instr, w_store, w_sec;
@@ -187,12 +191,13 @@ module ppc_mmu #(
     wire [TLB_BITS-1:0] w_ti = w_ea[12+TLB_BITS-1:12];
 
     assign wk_busy  = (ws != W_IDLE);
-    assign wk_done  = (ws == W_PTE1) || (ws == W_NF);
+    wire        w_update = w_allow && (w_pte1n != wk_rdata);   // R/C bits must be written back
+    assign wk_done  = (ws == W_RSP1 && wk_rvalid && !w_update) || (ws == W_WRSP && wk_rvalid) || (ws == W_NF);
     assign wk_nf    = (ws == W_NF);
-    assign wk_re    = (ws == W_PTE0) || (ws == W_PTE1);
-    assign wk_addr  = (ws == W_PTE1) ? w_pte + 32'd4 : w_pte;
-    assign wk_we    = (ws == W_PTE1) && w_allow && (w_pte1n != wk_rdata);
-    assign wk_wdata = w_pte1n;
+    assign wk_req   = (ws == W_REQ0) || (ws == W_REQ1) || (ws == W_WREQ);
+    assign wk_we    = (ws == W_WREQ);
+    assign wk_addr  = (ws == W_REQ0) ? w_pte : w_pte + 32'd4;
+    assign wk_wdata = w_wd;
 
     // ------------------------------------------------------------------
     // Registers
@@ -219,7 +224,7 @@ module ppc_mmu #(
             for (int i = 0; i < 16; i++) begin sr[i] <= 0; misc[i] <= 0; end
             sdr1 <= 0; dsisr <= 0; dar <= 0;
             itlb_v <= '0; dtlb_v <= '0;
-            ws <= W_IDLE; w_ea <= 0; w_instr <= 0; w_store <= 0; w_sec <= 0; w_idx <= 0;
+            ws <= W_IDLE; w_ea <= 0; w_instr <= 0; w_store <= 0; w_sec <= 0; w_idx <= 0; w_wd <= 0;
         end else begin
             if (spr_we) case (spr_idx) inside
                 10'd18: dsisr <= spr_wdata;
@@ -238,17 +243,19 @@ module ppc_mmu #(
 
             case (ws)
                 W_IDLE: if (wk_start) begin
-                    ws <= W_PTE0; w_ea <= wk_ea; w_instr <= wk_instr; w_store <= wk_store;
+                    ws <= W_REQ0; w_ea <= wk_ea; w_instr <= wk_instr; w_store <= wk_store;
                     w_sec <= 1'b0; w_idx <= 3'd0;
                 end
-                W_PTE0: begin
-                    if (w_match) ws <= W_PTE1;
-                    else if (w_idx != 3'd7) w_idx <= w_idx + 3'd1;
-                    else if (!w_sec) begin w_sec <= 1'b1; w_idx <= 3'd0; end
+                W_REQ0: if (wk_gnt) ws <= W_RSP0;
+                W_RSP0: if (wk_rvalid) begin
+                    if (w_match) ws <= W_REQ1;
+                    else if (w_idx != 3'd7) begin w_idx <= w_idx + 3'd1; ws <= W_REQ0; end
+                    else if (!w_sec) begin w_sec <= 1'b1; w_idx <= 3'd0; ws <= W_REQ0; end
                     else ws <= W_NF;
                 end
-                W_PTE1: begin
-                    // cache the translation; Changed reflects what is now in memory
+                W_REQ1: if (wk_gnt) ws <= W_RSP1;
+                W_RSP1: if (wk_rvalid) begin
+                    // cache the translation; Changed reflects what will be in memory
                     if (w_instr) begin
                         itlb[w_ti] <= '{vsid: w_seg[23:0], tag: w_ea[27:12+TLB_BITS], rpn: wk_rdata[31:12],
                                         pp: wk_rdata[1:0], c: wk_rdata[7]};
@@ -258,8 +265,11 @@ module ppc_mmu #(
                                         pp: wk_rdata[1:0], c: w_allow ? w_pte1n[7] : wk_rdata[7]};
                         dtlb_v[w_ti] <= 1'b1;
                     end
-                    ws <= W_IDLE;
+                    w_wd <= w_pte1n;
+                    ws <= w_update ? W_WREQ : W_IDLE;
                 end
+                W_WREQ: if (wk_gnt) ws <= W_WRSP;
+                W_WRSP: if (wk_rvalid) ws <= W_IDLE;
                 W_NF: ws <= W_IDLE;
             endcase
         end

@@ -68,7 +68,11 @@ module ppc_core #(
     // ------------------------------------------------------------------
     logic [31:0] i_pa, i_fbits, d_pa, d_fbits, wk_addr, wk_wdata, xspr_rdata, sr_rdata;
     logic        i_ok, i_miss, i_flt, d_ok, d_miss, d_flt;
-    logic        wk_start, wk_busy, wk_done, wk_nf, wk_re, wk_we, xspr_valid;
+    logic        wk_start, wk_busy, wk_done, wk_nf, wk_req, wk_we, xspr_valid;
+    // the walker speaks a request/response bus; this core's memory answers in
+    // the same cycle, so the response is simply registered
+    logic        wk_rv;
+    logic [31:0] wk_rd;
 
     // execute outputs
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
@@ -102,7 +106,8 @@ module ppc_core #(
         .i_ea(pc), .i_pa, .i_ok, .i_miss, .i_flt, .i_fbits,
         .d_ea(ea), .d_store(st), .d_pa, .d_ok, .d_miss, .d_flt, .d_fbits,
         .wk_start, .wk_instr(i_walk), .wk_store(st), .wk_ea(i_walk ? pc : ea),
-        .wk_busy, .wk_done, .wk_nf, .wk_re, .wk_we, .wk_addr, .wk_wdata, .wk_rdata(dmem_rdata),
+        .wk_busy, .wk_done, .wk_nf, .wk_req, .wk_we, .wk_addr, .wk_wdata,
+        .wk_gnt(1'b1), .wk_rvalid(wk_rv), .wk_rdata(wk_rd),
         .spr_idx, .spr_rdata(xspr_rdata), .spr_rvalid(xspr_valid),
         .spr_we(spr_we & commit), .spr_wdata(spr_val),
         .sr_idx, .sr_rdata, .sr_we(sr_we & commit), .sr_wdata(gpr[rs_idx]),
@@ -138,8 +143,8 @@ module ppc_core #(
     // the walker borrows the data port while it runs
     assign dmem_addr  = wk_busy ? wk_addr  : d_pa;
     assign dmem_size  = wk_busy ? 2'd2     : msize;
-    assign dmem_re    = wk_busy ? wk_re    : ld & commit;
-    assign dmem_we    = wk_busy ? wk_we    : st & commit;
+    assign dmem_re    = wk_busy ? (wk_req & ~wk_we) : ld & commit;
+    assign dmem_we    = wk_busy ? (wk_req & wk_we)  : st & commit;
     assign dmem_wdata = wk_busy ? wk_wdata : st_data;
 
     // trace
@@ -164,10 +169,11 @@ module ppc_core #(
             resv <= 0; resv_addr <= 0; fp_a <= 0; fp_b <= 0; fp_lo <= 0;
             tb <= 0; dec_pend <= 0;
             ms_active <= 0; ms_reg <= 0;
-            nf_i <= 0; nf_d <= 0;
+            nf_i <= 0; nf_d <= 0; wk_rv <= 0; wk_rd <= 0;
             instret <= 0; cycles <= 0;
         end else begin
             cycles <= cycles + 64'd1;
+            wk_rv <= wk_req; wk_rd <= dmem_rdata;
             if (wk_done && wk_nf) begin
                 if (i_walk) nf_i <= 1; else nf_d <= 1;
             end

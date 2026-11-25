@@ -9,13 +9,13 @@ for t in "$@"; do
     python3 tools/qemu_sys.py $B/$t.q.elf $B/$t.qemu.out; qrc=$?
     ok=1
     for c in 0 1; do
-        build/sim$c/Vsoc_top +img=$B/$t.hex >$B/$t.sim$c.out 2>$B/$t.sim$c.log; rc=$?
+        build/sim$c/Vsoc_top +img=$B/$t.hex +max_cycles=20000000 >$B/$t.sim$c.out 2>$B/$t.sim$c.log; rc=$?
         if [ $rc -ne $qrc ] || ! cmp -s $B/$t.sim$c.out $B/$t.qemu.out; then
             ok=0; echo "FAIL  $t core$c vs QEMU (sim rc=$rc, qemu rc=$qrc)"
             diff $B/$t.qemu.out $B/$t.sim$c.out | head -20
         fi
     done
-    build/ls/Vlockstep_top +img=$B/$t.hex >/dev/null 2>$B/$t.ls.log; lrc=$?
+    build/ls/Vlockstep_top +img=$B/$t.hex +max_cycles=20000000 >/dev/null 2>$B/$t.ls.log; lrc=$?
     if [ $lrc -ne $qrc ]; then ok=0; echo "FAIL  $t lockstep (rc=$lrc)"; head -14 $B/$t.ls.log; fi
     if [ $ok -eq 1 ]; then printf "PASS  %-8s %s\n" "$t" "$(grep -o 'lockstep: .*' $B/$t.ls.log)"; pass=$((pass+1)); else fail=$((fail+1)); fi
 done

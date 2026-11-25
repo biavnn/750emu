@@ -11,7 +11,8 @@ module soc_top #(
     parameter int MEM_BYTES = 1 << 20,
     parameter logic [31:0] RESET_PC = 32'h0000_0100,
     parameter int CORE      = 1,     // 0 = single-cycle reference, 1 = pipeline
-    parameter bit QUIET     = 0      // suppress UART output (second core in lockstep)
+    parameter bit QUIET     = 0,     // suppress UART output (second core in lockstep)
+    parameter bit BUS_JITTER = 0     // pipeline only: random bus wait states (stress test)
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -65,10 +66,56 @@ module soc_top #(
         assign stall_ld_use = 0;
         assign flush_branch = 0;
     end else begin : g_pipe
+        // Request/response buses on top of the memory model below. Without
+        // jitter this behaves like block RAM: always ready, response the next
+        // cycle. With BUS_JITTER, requests are refused and responses delayed at
+        // pseudo-random, which must not change what the program does.
+        logic        ibus_req, ibus_gnt, ibus_rvalid, dbus_req, dbus_gnt, dbus_we, dbus_rvalid;
+        logic [31:0] ibus_addr, ibus_rdata, dbus_addr, dbus_wdata, dbus_rdata;
+        logic [1:0]  dbus_size;
+        logic        i_pend, d_pend;
+        logic [1:0]  i_wait, d_wait;
+        logic [31:0] lfsr, i_data, d_data;
+
+        assign ibus_rvalid = i_pend && (i_wait == 2'd0);
+        assign dbus_rvalid = d_pend && (d_wait == 2'd0);
+        // read data is only meaningful in the response cycle
+        assign ibus_rdata = ibus_rvalid ? i_data : 32'hDEAD_BEEF;
+        assign dbus_rdata = dbus_rvalid ? d_data : 32'hDEAD_BEEF;
+        assign ibus_gnt = (!i_pend || ibus_rvalid) && !(BUS_JITTER && lfsr[3] && lfsr[11]);
+        assign dbus_gnt = (!d_pend || dbus_rvalid) && !(BUS_JITTER && lfsr[5] && lfsr[17]);
+        assign imem_addr  = ibus_addr;
+        assign dmem_addr  = dbus_addr;
+        assign dmem_size  = dbus_size;
+        assign dmem_wdata = dbus_wdata;
+        assign dmem_re    = dbus_req && dbus_gnt && !dbus_we;
+        assign dmem_we    = dbus_req && dbus_gnt && dbus_we;
+
+        always_ff @(posedge clk) begin
+            if (rst) begin
+                i_pend <= 0; d_pend <= 0; i_wait <= 0; d_wait <= 0; lfsr <= 32'hC0FF_EE11;
+                i_data <= 0; d_data <= 0;
+            end else begin
+                lfsr <= {lfsr[30:0], lfsr[31] ^ lfsr[21] ^ lfsr[1] ^ lfsr[0]};
+                if (ibus_rvalid) i_pend <= 0;
+                else if (i_pend) i_wait <= i_wait - 2'd1;
+                if (ibus_req && ibus_gnt) begin
+                    i_pend <= 1; i_data <= imem_rdata;
+                    i_wait <= BUS_JITTER ? (lfsr[8] ? lfsr[14:13] : 2'd0) : 2'd0;
+                end
+                if (dbus_rvalid) d_pend <= 0;
+                else if (d_pend) d_wait <= d_wait - 2'd1;
+                if (dbus_req && dbus_gnt) begin
+                    d_pend <= 1; d_data <= dmem_rdata;
+                    d_wait <= BUS_JITTER ? (lfsr[9] ? lfsr[20:19] : 2'd0) : 2'd0;
+                end
+            end
+        end
+
         ppc_pipe #(.RESET_PC(RESET_PC)) u_core (
             .clk, .rst, .irq(1'b0),
-            .imem_addr, .imem_rdata,
-            .dmem_addr, .dmem_size, .dmem_re, .dmem_we, .dmem_wdata, .dmem_rdata,
+            .ibus_req, .ibus_gnt, .ibus_addr, .ibus_rvalid, .ibus_rdata,
+            .dbus_req, .dbus_gnt, .dbus_addr, .dbus_size, .dbus_we, .dbus_wdata, .dbus_rvalid, .dbus_rdata,
             .instret, .cycles,
             .tr_valid, .tr_pc, .tr_insn, .tr_rf_we, .tr_rf_idx, .tr_rf_val,
             .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr, .tr_msr, .tr_exc,

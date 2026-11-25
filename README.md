@@ -4,12 +4,12 @@ An open 32-bit PowerPC core (G3/750-class), with the long-term goal of booting
 classic Mac OS 9 on an FPGA. The design target is "what Mac OS accepts as a G3",
 not a clone of the real 750's out-of-order microarchitecture.
 
-## Status: phases 2 and 3 done in simulation (Linux boots; FPU implemented)
+## Status: phases 2 and 3 done; phase 4 (hardware realism) started
 
 An unmodified Linux 6.8 kernel (plus a 90-line platform file, see `linux/`)
 boots on the pipelined core in simulation, mounts its initramfs, runs a small
 user-space program that makes system calls and sleeps on the timer, and powers
-off: about 21 million instructions and 29 million cycles. The user program
+off: about 21 million instructions and 32 million cycles. The user program
 also uses floating point, which exercises the kernel's lazy FPU switching. The console log is in `docs/linux-boot.log`. `make linux-test`
 boots the same image on QEMU's 750 and on the pipeline, compares what user
 space printed, and then runs the whole boot with the pipeline and the
@@ -19,10 +19,18 @@ Two cores share one execute unit (`rtl/ppc_exec.sv`), so they implement
 identical instruction semantics:
 
 - `rtl/ppc_core.sv`: single-cycle reference core (stage 0), easy to read, the golden RTL model
-- `rtl/ppc_pipe.sv`: 5-stage in-order pipeline (IF/ID/EX/MEM/WB) with full
-  forwarding, a one-cycle load-use interlock, static branch prediction in ID
-  (taken for `b`, unconditional `bc`/`blr`/`bctr`, and backward `bc`), and
-  `lmw`/`stmw` sequenced one register per cycle
+- `rtl/ppc_pipe.sv`: 6-stage in-order pipeline (F1/F2/ID/EX/MEM/WB) with full
+  forwarding, a load-use interlock, static branch prediction in ID (taken for
+  `b`, unconditional `bc`/`blr`/`bctr`, and backward `bc`), and a sequencer for
+  multi-step instructions
+
+The pipeline reaches memory through two request/response buses (`ibus`,
+`dbus`): a request is accepted when `gnt` is high and answered one or more
+cycles later with `rvalid`. That is how block RAM behaves (answer the next
+cycle), and a cache or slower bus only has to delay `gnt` or `rvalid`. The
+page-table walker uses the same protocol. The reference core keeps its simple
+same-cycle memory; because the two cores are compared per executed step, bus
+timing does not affect the comparison.
 
 Verification, all passing:
 
@@ -31,6 +39,8 @@ Verification, all passing:
 | `make test` | both cores vs QEMU (`qemu-ppc -cpu 750`) on the C/asm test programs, then pipeline vs reference in lockstep |
 | `make test` (supervisor part) | bare-metal exception tests on both cores vs full-system QEMU (`qemu-system-ppc -M 40p -cpu 750`), plus lockstep |
 | `make fprandtest` | random and boundary-directed floating-point programs: pipeline vs QEMU after every instruction, plus lockstep |
+| `make test` (last part) | every test again in lockstep with pseudo-random wait states on both buses of the pipeline (requests refused, responses delayed up to 3 cycles) |
+| `make linux-jitter` | the whole Linux boot in lockstep under the same random wait states |
 | `make randtest` | random instruction programs (now including string ops, `dcbz`, `lwarx`/`stwcx.`): pipeline vs QEMU output, plus lockstep vs reference. 230 seeds x 2,000 instructions pass |
 
 Supervisor tests (`sw/sys/`): `exc` (every exception type, user mode), `irq`
@@ -47,14 +57,19 @@ writes, CR/XER/LR/CTR, store address/data) and prints the first divergence with
 context. Planted bugs (wrong forwarding priority, wrong rotate mask) were caught
 within a few seeds.
 
-Pipeline CPI on the current tests (combinational memories, no caches yet):
+Pipeline CPI with block-RAM-style memory (response the cycle after the
+request, no caches yet):
 
 | Test | CPI |
 |---|---|
-| arith | 1.11 |
-| isa | 1.18 |
-| hello | 1.20 |
-| sort | 1.24 |
+| arith | 1.19 |
+| isa | 1.31 |
+| hello | 1.35 |
+| sort | 1.40 |
+| Linux boot | 1.51 |
+
+The extra fetch stage costs one more cycle per taken or mispredicted branch
+than the earlier 5-stage version (Linux boot was 1.34).
 
 Implemented ISA: integer arithmetic (all carrying, extended, overflow and record
 forms), multiply/divide, logical, shifts, rotates, `cntlzw`, `extsb`/`extsh`,
@@ -250,14 +265,15 @@ test passes when both produce identical output and exit codes.
 
 ## Next steps
 
-1. Hardware realism (phase 4): synchronous block-RAM memories with fetch and
-   load latency, caches, an iterative FPU and divider, a real-time time base,
-   split GPR/FPR register files, 2-way TLBs; then synthesis and FPGA bring-up
-   on an Artix-7 board.
-2. A fuller Linux user space as a harder test: BusyBox or a small glibc/musl
+1. Rest of phase 4: instruction and data caches behind the two buses, an
+   iterative FPU and integer divider (both are single-cycle combinational
+   blocks today), a real-time time base, separate GPR and FPR register files,
+   2-way TLBs; then synthesis and FPGA bring-up on an Artix-7 board with DDR3.
+2. Performance: a branch target buffer and prediction in F1/F2 to win back the
+   extra fetch stage.
+3. A fuller Linux user space as a harder test: BusyBox or a small glibc/musl
    program set, UART receive for an interactive console, an external interrupt
    controller.
-3. Remaining FP items: `fres`/`frsqrte`, enabled-exception traps, an FR check
+4. Remaining FP items: `fres`/`frsqrte`, enabled-exception traps, an FR check
    against IEEE test vectors or real hardware.
-4. Performance: branch target buffer (CPI is 1.34 on the Linux boot).
 5. Mac OS 9 platform (phase 5).
