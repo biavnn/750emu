@@ -49,6 +49,7 @@ module ppc_pipe #(
     output logic [31:0] ibus_addr,
     input  logic        ibus_rvalid,
     input  logic [31:0] ibus_rdata,
+    output logic        icache_flush,   // icbi executed or HID0[ICFI] written
     // data bus (physical addresses; size 0/1/2 = byte/half/word, data right-aligned)
     output logic        dbus_req,
     input  logic        dbus_gnt,
@@ -223,7 +224,7 @@ module ppc_pipe #(
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
     logic [31:0] msr_n, srr0_n, srr1_n;
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
-    logic        take_int, ctx_sync, sr_we, tlbie, mc_busy;
+    logic        take_int, ctx_sync, sr_we, tlbie, mc_busy, icbi;
     logic [3:0]  sr_idx;
     logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, resv_set, resv_clr;
     logic [6:0]  wa_idx;
@@ -243,7 +244,7 @@ module ppc_pipe #(
         .int_ext(irq), .int_dec(dec_pend),
         .isi(e_iflt | (e_imiss & e_nf_i)), .isi_bits(e_iflt ? e_ifbits : 32'h4000_0000),
         .xspr_valid, .xspr_rdata, .sr_rdata,
-        .take_int, .ctx_sync, .sr_we, .sr_idx, .tlbie,
+        .take_int, .ctx_sync, .sr_we, .sr_idx, .tlbie, .icbi,
         .msr_n, .srr_we, .srr0_n, .srr1_n, .exc, .int_ack_dec,
         .next_pc, .wa_en, .wa_idx, .wa_val, .wb_en, .wb_val,
         .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val,
@@ -277,6 +278,8 @@ module ppc_pipe #(
     wire [31:0] redirect_pc = dsi ? ppc_pkg::exc_vector(msr, 20'h00300) : next_pc;
     wire irefetch  = wk_done && !wk_nf && e_iwalk;                // page now in the ITLB: fetch again
     wire hold      = e_valid && (!ex_go || ms_cont);              // EX keeps its instruction
+
+    assign icache_flush = ex_commit && (icbi || (spr_we && spr_idx == 10'd1008 && spr_val[11]));
 
     assign dbus_req   = wk_busy ? wk_req   : (ex_try && mem_need);
     assign dbus_addr  = wk_busy ? wk_addr  : d_pa;

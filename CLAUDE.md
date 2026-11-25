@@ -44,7 +44,10 @@ build/ls/Vlockstep_top +img=build/sys/mmu.hex    # one test in lockstep; prints 
 - All exceptions are recognised in EX, and all architectural state except the
   register file commits there. A store commits when its bus request is granted.
 - The pipeline's memory buses are request/grant with a later `rvalid`; one
-  request outstanding per bus.
+  request outstanding per bus, and a slave grants a new request only once the
+  previous response has been delivered. `rtl/cache.sv` relies on that.
+- `ppc_exec` contains two multi-cycle units (FPU, integer divider) and raises
+  `busy`; a core must not complete the step while it is high.
 
 ## How changes are verified (please keep doing this)
 
@@ -86,6 +89,6 @@ build/ls/Vlockstep_top +img=build/sys/mmu.hex    # one test in lockstep; prints 
 
 ## Not done yet (see README for detail)
 
-Caches, synthesis and FPGA bring-up, a branch target buffer, `fres`/`frsqrte`,
+Synthesis and FPGA bring-up, a branch target buffer, wider caches, `fres`/`frsqrte`,
 trapping FP exceptions, an interactive Linux console, the Mac OS 9 platform.
 Nothing has been synthesised: resource and timing numbers are unknown.

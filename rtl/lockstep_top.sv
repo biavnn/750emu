@@ -4,6 +4,7 @@
 module lockstep_top #(
     parameter int MEM_BYTES = 1 << 20,
     parameter bit BUS_JITTER = 0,
+    parameter bit CACHES = 1,
     parameter logic [31:0] RESET_PC = 32'h0000_0100
 ) (
     input logic clk,
@@ -93,7 +94,7 @@ module lockstep_top #(
         .tr_st_data(ref_tr_st_data),
         .tr_st_size(ref_tr_st_size)
     );
-    soc_top #(.CORE(1), .QUIET(0), .MEM_BYTES(MEM_BYTES), .RESET_PC(RESET_PC), .BUS_JITTER(BUS_JITTER)) dut_soc (
+    soc_top #(.CORE(1), .QUIET(0), .MEM_BYTES(MEM_BYTES), .RESET_PC(RESET_PC), .BUS_JITTER(BUS_JITTER), .CACHES(CACHES)) dut_soc (
         .clk, .rst,
         .done(dut_done),
         .exit_code(dut_exit_code),

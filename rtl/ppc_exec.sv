@@ -67,6 +67,7 @@ module ppc_exec #(
     output logic        sr_we,      // SR[sr_idx] <- vs
     output logic [3:0]  sr_idx,
     output logic        tlbie,      // invalidate TLB entries for EA = vb
+    output logic        icbi,       // instruction cache block invalidate
     output logic [31:0] msr_n,      // MSR after this step
     output logic        srr_we,     // exception entry: write SRR0/SRR1
     output logic [31:0] srr0_n, srr1_n,
@@ -358,7 +359,7 @@ module ppc_exec #(
         spr_we = 1'b0; spr_val = vs;
         msr_we = 1'b0;
         illegal = 1'b0; priv = 1'b0; trapc = 1'b0; fpu = 1'b0; fp_impl = 1'b0; fpscr_n = fpscr; fp_mask = 32'd0; sc_c = 1'b0; rfi_c = 1'b0;
-        ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0;
+        ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0; icbi = 1'b0;
         retire = 1'b1;
         ms_active_n = 1'b0; ms_reg_n = 7'd0;
         ld = 1'b0; st = 1'b0; ld_sext = 1'b0; ld_brev = 1'b0; upd = 1'b0;
@@ -434,7 +435,7 @@ module ppc_exec #(
                 10'd129: cr_n[31 - f_rt] =   crbit(cr, f_ra) & ~crbit(cr, f_rb);   // crandc
                 10'd417: cr_n[31 - f_rt] =   crbit(cr, f_ra) | ~crbit(cr, f_rb);   // crorc
                 10'd0:   cr_n[31 - 4*f_crfd -: 4] = cr[31 - 4*f_crfs -: 4];         // mcrf
-                10'd150: ;                                                           // isync
+                10'd150: ctx_sync = 1;                                               // isync: refetch what follows
                 10'd50:  if (pr) priv = 1; else rfi_c = 1;                           // rfi
                 default: illegal = 1;
             endcase
@@ -718,7 +719,8 @@ module ppc_exec #(
                             end
 
                             // cache / ordering hints: no-ops in this core
-                            10'd598, 10'd854, 10'd86, 10'd54, 10'd278, 10'd246, 10'd982: ;
+                            10'd982: begin icbi = 1; ctx_sync = 1; end                        // icbi
+                            10'd598, 10'd854, 10'd86, 10'd54, 10'd278, 10'd246: ;
 
                             default: illegal = 1;
                         endcase
@@ -812,7 +814,7 @@ module ppc_exec #(
             cr_n = cr; xer_n = xer; lr_n = lr; ctr_n = ctr; spr_we = 1'b0;
             ms_active_n = 1'b0; ms_reg_n = 7'd0; retire = 1'b1;
             resv_set = 1'b0; resv_clr = 1'b0; fpscr_n = fpscr; fpt_we = 1'b0; fplo_we = 1'b0;
-            ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0;
+            ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0; icbi = 1'b0;
             srr_we = 1'b1;
             msr_n = msr & 32'h0000_1040;                             // keep ME and IP only
             next_pc = {msr[6] ? 12'hFFF : 12'h000, exc_vec};

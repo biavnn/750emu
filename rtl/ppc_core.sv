@@ -78,7 +78,7 @@ module ppc_core #(
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
     logic [31:0] msr_n, srr0_n, srr1_n;
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
-    logic        take_int, ctx_sync, sr_we, tlbie, mc_busy;
+    logic        take_int, ctx_sync, sr_we, tlbie, mc_busy, icbi_unused;
     logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, ms_ruse, resv_set, resv_clr;
     logic [6:0]  wa_idx, ms_ridx;
     logic [6:0]  ms_reg_n;
@@ -127,7 +127,7 @@ module ppc_core #(
         .int_ext(irq), .int_dec(dec_pend),
         .isi(i_fault), .isi_bits(i_flt ? i_fbits : 32'h4000_0000),
         .xspr_valid, .xspr_rdata, .sr_rdata,
-        .take_int, .ctx_sync, .sr_we, .sr_idx, .tlbie,
+        .take_int, .ctx_sync, .sr_we, .sr_idx, .tlbie, .icbi(icbi_unused),
         .msr_n, .srr_we, .srr0_n, .srr1_n, .exc, .int_ack_dec,
         .next_pc, .wa_en, .wa_idx, .wa_val, .wb_en, .wb_val,
         .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val,

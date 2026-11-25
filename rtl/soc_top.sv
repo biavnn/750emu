@@ -12,7 +12,8 @@ module soc_top #(
     parameter logic [31:0] RESET_PC = 32'h0000_0100,
     parameter int CORE      = 1,     // 0 = single-cycle reference, 1 = pipeline
     parameter bit QUIET     = 0,     // suppress UART output (second core in lockstep)
-    parameter bit BUS_JITTER = 0     // pipeline only: random bus wait states (stress test)
+    parameter bit BUS_JITTER = 0,    // pipeline only: random bus wait states (stress test)
+    parameter bit CACHES     = 1     // pipeline only: instruction and data caches
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -70,9 +71,40 @@ module soc_top #(
         // jitter this behaves like block RAM: always ready, response the next
         // cycle. With BUS_JITTER, requests are refused and responses delayed at
         // pseudo-random, which must not change what the program does.
+        // ibus/dbus are the memory-side buses; cibus/cdbus are the core's.
         logic        ibus_req, ibus_gnt, ibus_rvalid, dbus_req, dbus_gnt, dbus_we, dbus_rvalid;
         logic [31:0] ibus_addr, ibus_rdata, dbus_addr, dbus_wdata, dbus_rdata;
         logic [1:0]  dbus_size;
+        logic        cibus_req, cibus_gnt, cibus_rvalid, cdbus_req, cdbus_gnt, cdbus_we, cdbus_rvalid;
+        logic [31:0] cibus_addr, cibus_rdata, cdbus_addr, cdbus_wdata, cdbus_rdata;
+        logic [1:0]  cdbus_size;
+        logic        icache_flush;
+
+        if (CACHES) begin : g_caches
+            logic [1:0]  i_size_unused;
+            logic        i_we_unused;
+            logic [31:0] i_wdata_unused;
+            cache u_icache (
+                .clk, .rst, .flush(icache_flush),
+                .c_req(cibus_req), .c_gnt(cibus_gnt), .c_addr(cibus_addr), .c_size(2'd2), .c_we(1'b0),
+                .c_wdata(32'd0), .c_rvalid(cibus_rvalid), .c_rdata(cibus_rdata),
+                .m_req(ibus_req), .m_gnt(ibus_gnt), .m_addr(ibus_addr), .m_size(i_size_unused),
+                .m_we(i_we_unused), .m_wdata(i_wdata_unused), .m_rvalid(ibus_rvalid), .m_rdata(ibus_rdata)
+            );
+            cache u_dcache (
+                .clk, .rst, .flush(1'b0),
+                .c_req(cdbus_req), .c_gnt(cdbus_gnt), .c_addr(cdbus_addr), .c_size(cdbus_size), .c_we(cdbus_we),
+                .c_wdata(cdbus_wdata), .c_rvalid(cdbus_rvalid), .c_rdata(cdbus_rdata),
+                .m_req(dbus_req), .m_gnt(dbus_gnt), .m_addr(dbus_addr), .m_size(dbus_size),
+                .m_we(dbus_we), .m_wdata(dbus_wdata), .m_rvalid(dbus_rvalid), .m_rdata(dbus_rdata)
+            );
+        end else begin : g_nocaches
+            assign ibus_req = cibus_req; assign cibus_gnt = ibus_gnt; assign ibus_addr = cibus_addr;
+            assign cibus_rvalid = ibus_rvalid; assign cibus_rdata = ibus_rdata;
+            assign dbus_req = cdbus_req; assign cdbus_gnt = dbus_gnt; assign dbus_addr = cdbus_addr;
+            assign dbus_size = cdbus_size; assign dbus_we = cdbus_we; assign dbus_wdata = cdbus_wdata;
+            assign cdbus_rvalid = dbus_rvalid; assign cdbus_rdata = dbus_rdata;
+        end
         logic        i_pend, d_pend;
         logic [1:0]  i_wait, d_wait;
         logic [31:0] lfsr, i_data, d_data;
@@ -114,8 +146,10 @@ module soc_top #(
 
         ppc_pipe #(.RESET_PC(RESET_PC)) u_core (
             .clk, .rst, .irq(1'b0),
-            .ibus_req, .ibus_gnt, .ibus_addr, .ibus_rvalid, .ibus_rdata,
-            .dbus_req, .dbus_gnt, .dbus_addr, .dbus_size, .dbus_we, .dbus_wdata, .dbus_rvalid, .dbus_rdata,
+            .ibus_req(cibus_req), .ibus_gnt(cibus_gnt), .ibus_addr(cibus_addr),
+            .ibus_rvalid(cibus_rvalid), .ibus_rdata(cibus_rdata), .icache_flush,
+            .dbus_req(cdbus_req), .dbus_gnt(cdbus_gnt), .dbus_addr(cdbus_addr), .dbus_size(cdbus_size),
+            .dbus_we(cdbus_we), .dbus_wdata(cdbus_wdata), .dbus_rvalid(cdbus_rvalid), .dbus_rdata(cdbus_rdata),
             .instret, .cycles,
             .tr_valid, .tr_pc, .tr_insn, .tr_rf_we, .tr_rf_idx, .tr_rf_val,
             .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr, .tr_msr, .tr_exc,

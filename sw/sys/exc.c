@@ -106,7 +106,7 @@ int test_main(void) {
     for (volatile int i = 0; i < 100000; i++) {}    // DEC passes zero with EE=0
     tprintf("  EE=0: count=%u, dec<0: %d\n", dec_count, (int)mfdec() < 0);
     mtmsr(mfmsr() | 0x8000);
-    for (volatile int i = 0; i < 1000 && !dec_count; i++) {}
+    for (volatile int i = 0; i < 100000000 && !dec_count; i++) {}   // QEMU delivers on host time
     mtmsr(mfmsr() & ~0x8000u);
     tprintf("  EE=1: count=%u srr1=%08x handler msr=%08x\n", dec_count, dec_srr1, dec_msr);
     for (volatile int i = 0; i < 1000; i++) {}

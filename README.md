@@ -9,7 +9,7 @@ not a clone of the real 750's out-of-order microarchitecture.
 An unmodified Linux 6.8 kernel (plus a 90-line platform file, see `linux/`)
 boots on the pipelined core in simulation, mounts its initramfs, runs a small
 user-space program that makes system calls and sleeps on the timer, and powers
-off: about 21 million instructions and 32 million cycles. The user program
+off: about 21 million instructions and 41 million cycles. The user program
 also uses floating point, which exercises the kernel's lazy FPU switching. The console log is in `docs/linux-boot.log`. `make linux-test`
 boots the same image on QEMU's 750 and on the pipeline, compares what user
 space printed, and then runs the whole boot with the pipeline and the
@@ -32,6 +32,15 @@ page-table walker uses the same protocol. The reference core keeps its simple
 same-cycle memory; because the two cores are compared per executed step, bus
 timing does not affect the comparison.
 
+`rtl/cache.sv` is a direct-mapped cache with 32-byte lines for that bus. The
+simulation SoC puts a 32 KiB instruction cache and a 32 KiB data cache between
+the pipeline and memory (`CACHES=0` removes them). Read hits run at one per
+cycle; a miss fetches the whole line; writes are write-through with no
+allocation, so memory is always current. `icbi` and HID0[ICFI] invalidate the
+whole instruction cache, and `icbi`/`isync` refetch what follows. I/O addresses
+(0xFxxxxxxx) and accesses that straddle a word boundary bypass the cache. As on
+real hardware, code that is rewritten without `icbi` may run stale.
+
 Verification, all passing:
 
 | Check | What it compares |
@@ -49,7 +58,9 @@ table, R/C bits, protection, faults, tlbie, segment switch), `vm` (all code and
 data through the page table via two aliased mappings that keep evicting each
 other from the TLBs, with interrupts), `insn` (atomics, `dcbz`, string ops,
 page-crossing loads and stores including a missing second page), `fp` (FP
-register moves, load/store forms, FPSCR). `sw/tests/fp.c` is compiled C
+register moves, load/store forms, FPSCR), `cache` (rewritten code with `icbi`
+and HID0[ICFI], data larger than the cache with conflicting lines, stores of
+every size and alignment). `sw/tests/fp.c` is compiled C
 floating-point code (series, Newton iterations, conversions).
 
 The lockstep checker compares every retired step (PC, instruction, register
@@ -57,20 +68,20 @@ writes, CR/XER/LR/CTR, store address/data) and prints the first divergence with
 context. Planted bugs (wrong forwarding priority, wrong rotate mask) were caught
 within a few seeds.
 
-Pipeline CPI with block-RAM-style memory (response the cycle after the
-request, no caches yet):
+Pipeline CPI with the caches in front of a memory that answers in one cycle:
 
 | Test | CPI |
 |---|---|
 | arith | 1.38 |
-| isa | 1.31 |
-| hello | 1.35 |
-| sort | 1.40 |
-| Linux boot | 1.51 |
+| isa | 1.69 |
+| sort | 1.42 |
+| Linux boot | 1.92 |
 
-The extra fetch stage costs one more cycle per taken or mispredicted branch
-than the earlier 5-stage version (Linux boot was 1.34). `arith` is
-divide-heavy and pays for the iterative divider.
+These are optimistic: a real memory (DDR3) will make every cache miss far more
+expensive. On the Linux boot about 2.4% of fetches and 2.2% of data reads miss
+the 32 KiB direct-mapped caches. Without caches and with the same ideal memory
+the boot runs at 1.51, so the caches currently cost time; they exist for the
+slow memory to come. `arith` is divide-heavy and pays for the iterative divider.
 
 Implemented ISA: integer arithmetic (all carrying, extended, overflow and record
 forms), multiply/divide, logical, shifts, rotates, `cntlzw`, `extsb`/`extsh`,
@@ -199,6 +210,7 @@ rtl/ppc_div.sv      iterative integer divider
 rtl/ppc_mmu.sv      BATs, segments, TLBs, page table walker
 rtl/ppc_core.sv     single-cycle reference core
 rtl/ppc_pipe.sv     5-stage pipeline
+rtl/cache.sv        direct-mapped write-through cache for the request/response bus
 rtl/soc_top.sv      simulation SoC: 1 MiB RAM, UART + exit MMIO at 0xF0000000; CORE=0/1 picks the core
 rtl/lockstep_top.sv both SoCs side by side for trace comparison
 sim/tb.cpp          Verilator driver (prints cycles, CPI, stalls, flushes)
@@ -275,8 +287,8 @@ test passes when both produce identical output and exit codes.
 
 ## Next steps
 
-1. Rest of phase 4: instruction and data caches behind the two buses, a
-   pipelined integer multiplier, a real-time time base, separate GPR and FPR register files,
+1. Rest of phase 4: a pipelined integer multiplier, a real-time time base,
+   separate GPR and FPR register files, 2-way (or wider) caches, per-line `icbi`,
    2-way TLBs; then synthesis and FPGA bring-up on an Artix-7 board with DDR3.
 2. Performance: a branch target buffer and prediction in F1/F2 to win back the
    extra fetch stage.
