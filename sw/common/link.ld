@@ -6,7 +6,7 @@ SECTIONS
 {
     /* Exception vector area starts at 0; the image is a flat binary from address 0. */
     . = 0;
-    .vectors : { LONG(0) . = 0x100; *(.reset) }
+    .vectors : { *(.vectors) }
 
     . = 0x4000;
     .text   : { *(.text .text.*) }

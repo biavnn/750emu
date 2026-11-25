@@ -1,6 +1,18 @@
-// Bare-metal backend for the g3core SoC.
+// Bare-metal backend: g3core SoC by default, QEMU 40p with -DPLAT_QEMU_40P.
 #include "tlib.h"
 
+#ifdef PLAT_QEMU_40P
+// QEMU "40p" machine (golden model for supervisor tests): 16550 UART in ISA
+// I/O space. There is no exit device, so print a sentinel the runner looks for.
+#define UART_THR  (*(volatile unsigned char *)0x800003F8u)
+
+void tputc(char c) { UART_THR = (unsigned char)c; }
+
+void texit(int code) {
+    tprintf("\n<<EXIT %d>>\n", code);
+    for (;;) {}
+}
+#else
 #define UART_TX   (*(volatile unsigned *)0xF0000000u)
 #define SIM_EXIT  (*(volatile unsigned *)0xF0000004u)
 
@@ -10,6 +22,7 @@ void texit(int code) {
     SIM_EXIT = (unsigned)code;
     for (;;) {}
 }
+#endif
 
 int main(void) {
     return test_main();

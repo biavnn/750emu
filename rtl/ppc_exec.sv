@@ -33,8 +33,13 @@ module ppc_exec #(
     output logic        spr_we,
     output logic [9:0]  spr_idx,
     output logic [31:0] spr_val,
-    output logic        msr_we,
-    output logic        illegal,
+    input  logic        int_ext,    // external interrupt request (level)
+    input  logic        int_dec,    // decrementer interrupt pending
+    output logic [31:0] msr_n,      // MSR after this step
+    output logic        srr_we,     // exception entry: write SRR0/SRR1
+    output logic [31:0] srr0_n, srr1_n,
+    output logic        exc,        // this step enters an exception (no other side effects)
+    output logic        int_ack_dec,
     output logic        retire,     // 0 for non-final lmw/stmw steps
     output logic        ms_active_n,
     output logic [4:0]  ms_reg_n,
@@ -47,7 +52,13 @@ module ppc_exec #(
     logic [31:0] sprg [4];
     assign sprg = '{sprg0, sprg1, sprg2, sprg3};
 
+    // Implemented MSR bits: EE PR FP ME FE0 SE BE FE1 IP IR DR RI
+    localparam logic [31:0] MSR_MASK = 32'h0000_FF72;
+
     logic        upd;
+    logic        msr_we, illegal, priv, trapc, fpu, sc_c, rfi_c, take_int;
+    logic [19:0] exc_vec;
+    wire         pr = msr[14];
     logic        rec_en; logic [31:0] rec_val;   // Rc=1 -> CR0
     logic        oe_en;  logic oe_ov;            // OE=1 -> XER[OV,SO]
 
@@ -102,6 +113,13 @@ module ppc_exec #(
         clz32 = 32'd32;
         for (int i = 0; i < 32; i++)
             if (x[i]) clz32 = 32'(31 - i);
+    endfunction
+
+    // tw/twi condition: TO = {lt, gt, eq, ltu, gtu}
+    function automatic logic trap_cond(input logic [31:0] a, input logic [31:0] b,
+                                       input logic [4:0] to);
+        trap_cond = (to[4] & ($signed(a) < $signed(b))) | (to[3] & ($signed(a) > $signed(b))) |
+                    (to[2] & (a == b)) | (to[1] & (a < b)) | (to[0] & (a > b));
     endfunction
 
     function automatic logic crbit(input logic [31:0] c, input logic [4:0] i);
@@ -189,7 +207,7 @@ module ppc_exec #(
         oe_en = 1'b0; oe_ov = 1'b0;
         spr_we = 1'b0; spr_idx = f_spr; spr_val = vs;
         msr_we = 1'b0;
-        illegal = 1'b0;
+        illegal = 1'b0; priv = 1'b0; trapc = 1'b0; fpu = 1'b0; sc_c = 1'b0; rfi_c = 1'b0;
         retire = 1'b1;
         ms_active_n = 1'b0; ms_reg_n = 5'd0;
         ld = 1'b0; st = 1'b0; ld_sext = 1'b0; ld_brev = 1'b0; upd = 1'b0;
@@ -266,6 +284,7 @@ module ppc_exec #(
                 10'd417: cr_n[31 - f_rt] =   crbit(cr, f_ra) | ~crbit(cr, f_rb);   // crorc
                 10'd0:   cr_n[31 - 4*f_crfd -: 4] = cr[31 - 4*f_crfs -: 4];         // mcrf
                 10'd150: ;                                                           // isync
+                10'd50:  if (pr) priv = 1; else rfi_c = 1;                           // rfi
                 default: illegal = 1;
             endcase
 
@@ -288,6 +307,13 @@ module ppc_exec #(
             end
 
             // ---------------- opcode 31 ----------------
+            6'd17: sc_c = 1;                                                         // sc
+            6'd3:  trapc = trap_cond(va, simm, f_rt);                                // twi
+
+            // floating point: not implemented yet. With MSR[FP]=0 these raise
+            // "FP unavailable" exactly like a real CPU, so an OS can emulate them.
+            6'd48, 6'd49, 6'd50, 6'd51, 6'd52, 6'd53, 6'd54, 6'd55, 6'd59, 6'd63: fpu = 1;
+
             6'd31: begin
                 ea = va0 + vb;
                 case (xo9)
@@ -365,9 +391,13 @@ module ppc_exec #(
                                          if (f_crm[7 - i]) cr_n[31 - 4*i -: 4] = vs[31 - 4*i -: 4];
                             10'd512: begin cr_n[31 - 4*f_crfd -: 4] = xer[31:28];            // mcrxr
                                            xer_n[31:28] = 4'd0; end
-                            10'd83:  begin wa_en = 1; wa_val = msr; end                       // mfmsr
-                            10'd146: msr_we = 1;                                              // mtmsr
-                            10'd339, 10'd371: begin                                           // mfspr, mftb
+                            10'd4:   trapc = trap_cond(va, vb, f_rt);                         // tw
+                            10'd535, 10'd567, 10'd599, 10'd631, 10'd663, 10'd695, 10'd727,
+                            10'd759, 10'd983: fpu = 1;                                        // lfsx..stfiwx
+                            10'd83:  if (pr) priv = 1;                                        // mfmsr
+                                     else begin wa_en = 1; wa_val = msr; end
+                            10'd146: if (pr) priv = 1; else msr_we = 1;                       // mtmsr
+                            10'd339, 10'd371: if (pr && f_spr[4]) priv = 1; else begin        // mfspr, mftb
                                 wa_en = 1;
                                 case (f_spr)
                                     10'd1:   wa_val = xer;
@@ -385,7 +415,7 @@ module ppc_exec #(
                                     default: illegal = 1;
                                 endcase
                             end
-                            10'd467: begin                                                    // mtspr
+                            10'd467: if (pr && f_spr[4]) priv = 1; else begin                 // mtspr
                                 case (f_spr)
                                     10'd1:   xer_n = vs;
                                     10'd8:   lr_n  = vs;
@@ -415,6 +445,37 @@ module ppc_exec #(
         if (oe_en) begin xer_n[30] = oe_ov; xer_n[31] = xer[31] | oe_ov; end
         if (rec_en)
             cr_n[31:28] = {rec_val[31], ~rec_val[31] & (|rec_val), rec_val == 32'd0, xer_n[31]};
+
+        // ---------------- MSR, rfi, exceptions ----------------
+        msr_n = msr;
+        if (msr_we) msr_n = vs & MSR_MASK;
+        if (rfi_c) begin msr_n = srr1 & MSR_MASK; next_pc = {srr0[31:2], 2'b00}; end
+
+        exc = 1'b0; exc_vec = 20'h0; int_ack_dec = 1'b0;
+        srr_we = 1'b0; srr0_n = pc; srr1_n = msr & 32'h87C0_FFFF;
+        // asynchronous interrupts are taken between instructions, before executing this one
+        take_int = (int_ext | int_dec) & msr[15] & ~ms_active;
+        if (take_int) begin
+            exc = 1'b1; exc_vec = int_ext ? 20'h00500 : 20'h00900; int_ack_dec = ~int_ext;
+        end else if (fpu && !msr[13]) begin
+            exc = 1'b1; exc_vec = 20'h00800;                         // FP unavailable
+        end else if (illegal || fpu) begin
+            exc = 1'b1; exc_vec = 20'h00700; srr1_n[19] = 1'b1;      // program: illegal instruction
+        end else if (priv) begin
+            exc = 1'b1; exc_vec = 20'h00700; srr1_n[18] = 1'b1;      // program: privileged
+        end else if (trapc) begin
+            exc = 1'b1; exc_vec = 20'h00700; srr1_n[17] = 1'b1;      // program: trap
+        end else if (sc_c) begin
+            exc = 1'b1; exc_vec = 20'h00C00; srr0_n = pc + 32'd4;    // system call
+        end
+        if (exc) begin
+            wa_en = 1'b0; wb_en = 1'b0; ld = 1'b0; st = 1'b0;
+            cr_n = cr; xer_n = xer; lr_n = lr; ctr_n = ctr; spr_we = 1'b0;
+            ms_active_n = 1'b0; ms_reg_n = 5'd0; retire = 1'b1;
+            srr_we = 1'b1;
+            msr_n = msr & 32'h0000_1040;                             // keep ME and IP only
+            next_pc = {msr[6] ? 12'hFFF : 12'h000, exc_vec};
+        end
     end
 
 endmodule

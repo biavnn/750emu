@@ -14,7 +14,7 @@ for ((s=first; s<first+n; s++)); do
     python3 tools/gen_random.py $s $len $t.S
     $CC $CF -ffreestanding -fno-builtin -msdata=none -G 0 -Wl,--build-id=none -nostdlib -nostartfiles \
         -static -no-pie -T sw/common/link.ld -o $t.elf sw/common/crt0.S sw/common/bare.c \
-        sw/common/tprintf.c sw/rand/rand.c $t.S -lgcc || { echo "BUILD FAIL seed $s"; fail=$((fail+1)); continue; }
+        sw/common/tprintf.c sw/common/exc.c sw/rand/rand.c $t.S -lgcc || { echo "BUILD FAIL seed $s"; fail=$((fail+1)); continue; }
     $CC $CF -static -no-pie -o $t.linux sw/common/linux.c sw/common/tprintf.c sw/rand/rand.c $t.S
     powerpc-linux-gnu-objcopy -O binary $t.elf $t.bin && python3 tools/bin2hex.py $t.bin $t.hex
     qemu-ppc -cpu 750 $t.linux > $t.qemu.out 2>&1

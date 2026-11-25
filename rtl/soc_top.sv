@@ -13,9 +13,6 @@ module soc_top #(
     input  logic        rst,
     output logic        done,
     output logic [31:0] exit_code,
-    output logic        trap,
-    output logic [31:0] trap_pc,
-    output logic [31:0] trap_insn,
     output logic        bus_err,
     output logic [31:0] bus_err_addr,
     output logic [63:0] instret,
@@ -26,7 +23,8 @@ module soc_top #(
     output logic [31:0] tr_pc, tr_insn,
     output logic        tr_rf_we,  output logic [4:0] tr_rf_idx, output logic [31:0] tr_rf_val,
     output logic        tr_up_we,  output logic [4:0] tr_up_idx, output logic [31:0] tr_up_val,
-    output logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr,
+    output logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr, tr_msr,
+    output logic        tr_exc,
     output logic        tr_st,     output logic [31:0] tr_st_addr, tr_st_data,
     output logic [1:0]  tr_st_size
 );
@@ -47,24 +45,24 @@ module soc_top #(
 
     generate if (CORE == 0) begin : g_core
         ppc_core u_core (
-            .clk, .rst,
+            .clk, .rst, .irq(1'b0),
             .imem_addr, .imem_rdata,
             .dmem_addr, .dmem_size, .dmem_re, .dmem_we, .dmem_wdata, .dmem_rdata,
-            .trap, .trap_pc, .trap_insn, .instret, .cycles,
+            .instret, .cycles,
             .tr_valid, .tr_pc, .tr_insn, .tr_rf_we, .tr_rf_idx, .tr_rf_val,
-            .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr,
+            .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr, .tr_msr, .tr_exc,
             .tr_st, .tr_st_addr, .tr_st_data, .tr_st_size
         );
         assign stall_ld_use = 0;
         assign flush_branch = 0;
     end else begin : g_pipe
         ppc_pipe u_core (
-            .clk, .rst,
+            .clk, .rst, .irq(1'b0),
             .imem_addr, .imem_rdata,
             .dmem_addr, .dmem_size, .dmem_re, .dmem_we, .dmem_wdata, .dmem_rdata,
-            .trap, .trap_pc, .trap_insn, .instret, .cycles,
+            .instret, .cycles,
             .tr_valid, .tr_pc, .tr_insn, .tr_rf_we, .tr_rf_idx, .tr_rf_val,
-            .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr,
+            .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr, .tr_msr, .tr_exc,
             .tr_st, .tr_st_addr, .tr_st_data, .tr_st_size,
             .stall_ld_use, .flush_branch
         );

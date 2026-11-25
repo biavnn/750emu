@@ -13,9 +13,12 @@
 // - GPRs are read in EX with forwarding from MEM and WB, so the only data
 //   hazard is load-use: the EX instruction waits one cycle when it needs the
 //   result of a load in MEM.
-// - CR/XER/LR/CTR/SPRs are committed in EX. Nothing after EX can fault yet,
-//   so this is safe; when data-access exceptions arrive (phase 2) MEM-stage
-//   faults will need these writes to move later or be undone.
+// - CR/XER/LR/CTR/MSR/SPRs are committed in EX, and every exception that
+//   exists so far (program, sc, FP unavailable, decrementer, external) is
+//   recognised in EX too, so exceptions are precise without any undo logic.
+//   When data-access faults arrive with the MMU, MEM-stage faults will need
+//   these writes to move later or be undone.
+// - Time base and decrementer advance once per EX step, matching ppc_core.
 // - Correctly predicted taken branches cost 1 cycle (the wrong-path fetch);
 //   mispredictions are fixed in EX and flush IF/ID and ID/EX (2 cycles).
 // - lmw/stmw stay in EX for one micro-op per register; the front end holds.
@@ -28,6 +31,7 @@ module ppc_pipe #(
 ) (
     input  logic        clk,
     input  logic        rst,
+    input  logic        irq,
     output logic [31:0] imem_addr,
     input  logic [31:0] imem_rdata,
     output logic [31:0] dmem_addr,
@@ -36,16 +40,14 @@ module ppc_pipe #(
     output logic        dmem_we,
     output logic [31:0] dmem_wdata,
     input  logic [31:0] dmem_rdata,
-    output logic        trap,
-    output logic [31:0] trap_pc,
-    output logic [31:0] trap_insn,
     output logic [63:0] instret,
     output logic [63:0] cycles,
     output logic        tr_valid,
     output logic [31:0] tr_pc, tr_insn,
     output logic        tr_rf_we,  output logic [4:0] tr_rf_idx, output logic [31:0] tr_rf_val,
     output logic        tr_up_we,  output logic [4:0] tr_up_idx, output logic [31:0] tr_up_val,
-    output logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr,
+    output logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr, tr_msr,
+    output logic        tr_exc,
     output logic        tr_st,     output logic [31:0] tr_st_addr, tr_st_data,
     output logic [1:0]  tr_st_size,
     // performance counters
@@ -78,13 +80,13 @@ module ppc_pipe #(
         logic        st;         logic [31:0] ea, st_data;
         logic [1:0]  size;       logic sext, brev;
         logic        retire;
-        logic [31:0] cr, xer, lr, ctr;   // trace snapshot after this step
+        logic [31:0] cr, xer, lr, ctr, msr;   // trace snapshot after this step
+        logic        exc;
     } stage_t;
 
     stage_t m, w;                                                 // EX/MEM, MEM/WB
 
-    logic trapping;
-    logic [1:0] drain;
+    logic dec_pend;
 
     // ------------------------------------------------------------------
     // IF
@@ -174,7 +176,8 @@ module ppc_pipe #(
     // EX: execute
     // ------------------------------------------------------------------
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
-    logic        wa_en, wb_en, spr_we, msr_we, illegal, retire, ms_active_n;
+    logic [31:0] msr_n, srr0_n, srr1_n;
+    logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
     logic        ld, st, ld_sext, ld_brev;
     logic [4:0]  wa_idx, ms_reg_n, ms_cur_unused;
     logic [9:0]  spr_idx;
@@ -186,14 +189,17 @@ module ppc_pipe #(
         .ms_active(e_ms_active), .ms_reg(e_ms_reg),
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
+        .int_ext(irq), .int_dec(dec_pend),
+        .msr_n, .srr_we, .srr0_n, .srr1_n, .exc, .int_ack_dec,
         .next_pc, .wa_en, .wa_idx, .wa_val, .wb_en, .wb_val,
-        .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val, .msr_we,
-        .illegal, .retire, .ms_active_n, .ms_reg_n, .ms_cur(ms_cur_unused),
+        .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val,
+        .retire, .ms_active_n, .ms_reg_n, .ms_cur(ms_cur_unused),
         .ld, .st, .ld_sext, .ld_brev, .msize, .ea, .st_data
     );
 
-    wire ex_go     = e_valid && !ld_use && !trapping;
-    wire ex_commit = ex_go && !illegal;
+    wire ex_go     = e_valid && !ld_use;      // one architectural step happens this cycle
+    wire ex_commit = ex_go;
+    wire [31:0] dec_n = (spr_we && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
     wire ms_cont   = ex_commit && ms_active_n;                    // lmw/stmw has more steps
     wire redirect  = ex_commit && retire && (next_pc != e_pred_pc);
     wire hold      = ld_use || ms_cont;
@@ -217,6 +223,7 @@ module ppc_pipe #(
     assign tr_rf_we  = w.rf_we;   assign tr_rf_idx = w.rf_idx;  assign tr_rf_val = w.rf_val;
     assign tr_up_we  = w.up_we;   assign tr_up_idx = w.up_idx;  assign tr_up_val = w.up_val;
     assign tr_cr = w.cr; assign tr_xer = w.xer; assign tr_lr = w.lr; assign tr_ctr = w.ctr;
+    assign tr_msr = w.msr; assign tr_exc = w.exc;
     assign tr_st = w.st; assign tr_st_addr = w.ea; assign tr_st_data = w.st_data; assign tr_st_size = w.size;
 
     // ------------------------------------------------------------------
@@ -230,17 +237,13 @@ module ppc_pipe #(
             e_ms_active <= 0; e_ms_reg <= 0;
             m <= '0; w <= '0;
             cr <= 0; xer <= 0; lr <= 0; ctr <= 0; msr <= 0;
-            srr0 <= 0; srr1 <= 0; dec_r <= 0; hid0 <= 0; hid1 <= 0;
+            srr0 <= 0; srr1 <= 0; dec_r <= 32'hFFFF_FFFF; hid0 <= 0; hid1 <= 0;
             for (int i = 0; i < 4; i++) sprg[i] <= 0;
             for (int i = 0; i < 32; i++) gpr[i] <= 0;
-            tb <= 0;
-            trapping <= 0; drain <= 0;
-            trap <= 0; trap_pc <= 0; trap_insn <= 0;
+            tb <= 0; dec_pend <= 0;
             instret <= 0; cycles <= 0; stall_ld_use <= 0; flush_branch <= 0;
-        end else if (!trap) begin
+        end else begin
             cycles <= cycles + 64'd1;
-            tb <= tb + 64'd1;
-            dec_r <= dec_r - 32'd1;
             if (ld_use)   stall_ld_use <= stall_ld_use + 64'd1;
             if (redirect) flush_branch <= flush_branch + 64'd1;
 
@@ -248,7 +251,7 @@ module ppc_pipe #(
             if (w.valid) begin
                 if (w.up_we) gpr[w.up_idx] <= w.up_val;
                 if (w.rf_we) gpr[w.rf_idx] <= w.rf_val;
-                if (w.retire) instret <= instret + 64'd1;
+                if (w.retire && !w.exc) instret <= instret + 64'd1;
             end
 
             // ---- MEM -> WB ----
@@ -264,13 +267,16 @@ module ppc_pipe #(
             m.st      <= st;         m.ea     <= ea;      m.st_data <= st_data;
             m.size    <= msize;      m.sext   <= ld_sext; m.brev    <= ld_brev;
             m.retire  <= retire;
-            m.cr <= cr_n; m.xer <= xer_n; m.lr <= lr_n; m.ctr <= ctr_n;
+            m.cr <= cr_n; m.xer <= xer_n; m.lr <= lr_n; m.ctr <= ctr_n; m.msr <= msr_n;
+            m.exc <= exc;
 
             if (ex_commit) begin
-                cr <= cr_n; xer <= xer_n; lr <= lr_n; ctr <= ctr_n;
-                if (msr_we) msr <= e_vs;
+                tb <= tb + 64'd1;
+                dec_r <= dec_n;
+                if (int_ack_dec) dec_pend <= 0;
+                if (!dec_r[31] && dec_n[31]) dec_pend <= 1;
+                cr <= cr_n; xer <= xer_n; lr <= lr_n; ctr <= ctr_n; msr <= msr_n;
                 if (spr_we) case (spr_idx)
-                    10'd22:  dec_r <= spr_val;
                     10'd26:  srr0 <= spr_val;
                     10'd27:  srr1 <= spr_val;
                     10'd272, 10'd273, 10'd274, 10'd275: sprg[spr_idx[1:0]] <= spr_val;
@@ -280,23 +286,13 @@ module ppc_pipe #(
                     10'd1009: hid1 <= spr_val;
                     default: ;
                 endcase
+                if (srr_we) begin srr0 <= srr0_n; srr1 <= srr1_n; end
                 e_ms_active <= ms_active_n;
                 e_ms_reg    <= ms_reg_n;
             end
 
-            // ---- trap: stop the front end, let MEM and WB drain ----
-            if (ex_go && illegal) begin
-                trapping <= 1; trap_pc <= e_pc; trap_insn <= e_insn; drain <= 2'd2;
-            end
-            if (trapping) begin
-                if (drain == 0) trap <= 1;
-                else drain <= drain - 2'd1;
-            end
-
             // ---- front end ----
-            if (trapping || (ex_go && illegal)) begin
-                d_valid <= 0; e_valid <= 0;
-            end else if (redirect) begin
+            if (redirect) begin
                 pc_f <= next_pc;
                 d_valid <= 0; e_valid <= 0;
             end else if (!hold) begin
