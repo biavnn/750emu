@@ -12,6 +12,9 @@ void tputs(const char *s);
 void tprintf(const char *fmt, ...);
 void texit(int code) __attribute__((noreturn));
 
+void tlib_enable_fp(void);   // allow FP instructions (sets MSR[FP] on bare metal)
+extern const int tlib_fp;    // define as 1 in tests whose compiled code uses floating point
+
 int test_main(void);
 
 #endif

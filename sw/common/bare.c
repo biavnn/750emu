@@ -24,7 +24,19 @@ void texit(int code) {
 }
 #endif
 
+void tlib_enable_fp(void) {
+    unsigned m;
+    __asm__ volatile("mfmsr %0" : "=r"(m));
+    m |= 0x2000;
+    __asm__ volatile("mtmsr %0; isync" : : "r"(m));
+}
+
+// A test that uses floating point defines `const int tlib_fp = 1;` so FP is
+// enabled before any compiled code can touch an FP register.
+__attribute__((weak)) extern const int tlib_fp;
+
 int main(void) {
+    if (&tlib_fp && tlib_fp) tlib_enable_fp();
     return test_main();
 }
 

@@ -23,6 +23,17 @@ module ppc_exec #(
     input  logic [31:0] resv_addr,
     input  logic [31:0] fpscr,
     output logic [31:0] fpscr_n,
+    // FP arithmetic: operand latches for three-operand instructions and the
+    // low word of a result waiting to be written (hidden state, like ms_reg)
+    input  logic [63:0] fp_a, fp_b,
+    input  logic [31:0] fp_lo,
+    output logic        fpt_we,
+    output logic [63:0] fpt_a, fpt_b,
+    output logic        fplo_we,
+    output logic [31:0] fplo,
+    // register file read selectors for va, vb, vs (FP instructions read FPR halves)
+    output logic [6:0]  ra_idx, rb_idx, rs_idx,
+    output logic [1:0]  ld_s2d,     // lfs: {enable, low half}
     input  logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1,
     input  logic [31:0] sprg0, sprg1, sprg2, sprg3,
     input  logic [63:0] tb,
@@ -124,13 +135,71 @@ module ppc_exec #(
     wire is_fiw  = (opcd == 6'd31 && xo10 == 10'd983);
     wire is_fpmv = (opcd == 6'd63) && (xo10 == 10'd72 || xo10 == 10'd40 || xo10 == 10'd264 || xo10 == 10'd136);
     wire is_mtfsf = (opcd == 6'd63) && (xo10 == 10'd711);
-    assign ms_ridx = is_mw    ? {2'b0, ms_cur} :
+    // FP arithmetic operand routing. Step numbering (sk):
+    //   three operands (fmadd family, fsel): 0 latch frA and frC, 1 compute with frB, 2 write low word
+    //   otherwise:                           0 compute,                               1 write low word
+    wire [4:0] f_rc5   = insn[10:6];
+    wire [4:0] xo5     = insn[5:1];
+    wire fp_aform = (opcd == 6'd59 || opcd == 6'd63) && insn[5];
+    wire fp_3op   = fp_aform && (xo5 >= 5'd28 || (xo5 == 5'd23 && opcd == 6'd63));
+    wire fp_2op   = fp_aform && (xo5 == 5'd18 || xo5 == 5'd20 || xo5 == 5'd21 || xo5 == 5'd25);
+    wire fp_1op   = (opcd == 6'd63) && !insn[5] && (xo10 == 10'd12 || xo10 == 10'd14 || xo10 == 10'd15);
+    wire fp_cmpi  = (opcd == 6'd63) && !insn[5] && (xo10 == 10'd0 || xo10 == 10'd32);
+    wire fp_arith = fp_3op | fp_2op | fp_1op | fp_cmpi;
+    wire is_stfs  = (opcd == 6'd52 || opcd == 6'd53) ||
+                    (opcd == 6'd31 && (xo10 == 10'd663 || xo10 == 10'd695));
+    wire [4:0] fp_breg = ((fp_3op && sk[1:0] == 2'd0) || (fp_2op && xo5 == 5'd25)) ? f_rc5 : f_rb;
+    assign ra_idx = fp_arith ? {1'b1, f_ra, 1'b0} : {2'b0, f_ra};
+    assign rs_idx = fp_arith ? {1'b1, f_ra, 1'b1} : is_stfs ? {1'b1, f_rt, 1'b0} : {2'b0, f_rt};
+    assign rb_idx = fp_arith ? {1'b1, fp_breg, 1'b0} : {2'b0, f_rb};
+
+    logic [3:0] fop;
+    always_comb begin
+        fop = 4'd0;
+        if (fp_cmpi)      fop = (xo10 == 10'd0) ? 4'd12 : 4'd13;
+        else if (fp_1op)  fop = (xo10 == 10'd12) ? 4'd9 : (xo10 == 10'd14) ? 4'd10 : 4'd11;
+        else if (fp_aform) case (xo5)
+            5'd18: fop = 4'd4;   5'd20: fop = 4'd2;   5'd21: fop = 4'd1;   5'd25: fop = 4'd3;
+            5'd23: fop = 4'd14;  5'd28: fop = 4'd6;   5'd29: fop = 4'd5;   5'd30: fop = 4'd8;
+            5'd31: fop = 4'd7;
+            default: ;
+        endcase
+    end
+    wire        fp_go = fp_arith && msr[13] && (sk[1:0] == (fp_3op ? 2'd1 : 2'd0));
+    logic [63:0] fpu_res;
+    logic [10:0] fpu_exc;
+    logic        fpu_fr, fpu_fi, fpu_setf;
+    logic [4:0]  fpu_fprf;
+    logic [3:0]  fpu_cmp;
+    ppc_fpu u_fpu (
+        .op(fp_go ? fop : 4'd0), .single(opcd == 6'd59 || fop == 4'd9), .rn(fpscr[1:0]), .ve(fpscr[7]),
+        .a(!fp_go ? 64'd0 : fp_3op ? fp_a : {va, vs}),
+        .b(!fp_go ? 64'd0 : {vb, v_ms}),
+        .c(!fp_go ? 64'd0 : fp_3op ? fp_b : {vb, v_ms}),
+        .res(fpu_res), .exc(fpu_exc), .fr(fpu_fr), .fi(fpu_fi),
+        .set_fprf(fpu_setf), .fprf(fpu_fprf), .cmp(fpu_cmp)
+    );
+    logic [31:0] fpscr_upd, fp_ebits;
+    always_comb begin
+        // {ox, ux, zx, xx, vxsnan, vxisi, vxidi, vxzdz, vximz, vxvc} -> bits 28..19, vxcvi -> bit 8
+        fp_ebits = {3'b000, fpu_exc[10:1], 10'd0, fpu_exc[0], 8'd0};
+        fpscr_upd = fpscr | fp_ebits;
+        if (|(fp_ebits & ~fpscr)) fpscr_upd[31] = 1'b1;
+        if (!fp_cmpi && fop != 4'd14) begin fpscr_upd[18] = fpu_fr; fpscr_upd[17] = fpu_fi; end
+        if (fpu_setf) fpscr_upd[16:12] = fpu_fprf;
+        if (fp_cmpi) fpscr_upd[15:12] = fpu_cmp;
+        fpscr_upd = fpscr_fix(fpscr_upd);
+    end
+
+    assign ms_ridx = fp_arith ? {1'b1, fp_breg, 1'b1} :
+                     is_stfs  ? {1'b1, f_rt, 1'b1} :
+                     is_mw    ? {2'b0, ms_cur} :
                      is_str   ? {2'b0, f_rt + sk[6:2]} :
                      is_fpst  ? {1'b1, f_rt, sk[0]} :
                      is_fiw   ? {1'b1, f_rt, 1'b1} :
                      is_fpmv  ? {1'b1, f_rb, sk[0]} :
                      is_mtfsf ? {1'b1, f_rb, 1'b1} : 7'd32;
-    assign ms_ruse = ms_active | is_mw | is_str | is_fpst | is_fiw | is_fpmv | is_mtfsf;
+    assign ms_ruse = ms_active | is_mw | is_str | is_fpst | is_fiw | is_fpmv | is_mtfsf | fp_arith | is_stfs;
 
     // FPSCR: FEX and VX are summaries of other bits
     function automatic logic [31:0] fpscr_fix(input logic [31:0] v);
@@ -262,6 +331,7 @@ module ppc_exec #(
         wa_en = 1'b0; wa_idx = {2'b0, f_rt}; wa_val = 32'd0;
         nonplain = 1'b0; ld_mrg = 1'b0; ld_pos = 2'd0; ld_acc = 1'b0;
         resv_set = 1'b0; resv_clr = 1'b0;
+        fpt_we = 1'b0; fplo_we = 1'b0; ld_s2d = 2'b00;
         sn = 7'd0;
         wb_en = 1'b0; wb_val = 32'd0;
         cr_n = cr; xer_n = xer; lr_n = lr; ctr_n = ctr;
@@ -378,7 +448,18 @@ module ppc_exec #(
             // Implemented so far: the FPR file with double load/store, register
             // moves and FPSCR access (what an OS needs to save/restore FP state).
             // Arithmetic and single-precision forms raise a program exception.
-            6'd48, 6'd49, 6'd52, 6'd53, 6'd59: fpu = 1;
+            6'd59: fpu = 1;                                                          // single arithmetic (below)
+            6'd48, 6'd49: begin                                                      // lfs(u): load, widen, two halves
+                fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2; ld = 1;
+                ld_s2d = {1'b1, sk[0]}; wa_idx = {1'b1, f_rt, sk[0]};
+                if (!sk[0]) begin next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1; end
+                else if (opcd[0]) begin wb_en = 1; wb_val = ea; end
+            end
+            6'd52, 6'd53: begin                                                      // stfs(u)
+                fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2; st = 1;
+                st_data = ppc_pkg::dbl2sgl({vs, v_ms});
+                if (opcd[0]) begin wb_en = 1; wb_val = ea; end
+            end
             6'd50, 6'd51, 6'd54, 6'd55: begin                                        // lfd(u), stfd(u)
                 fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2;
                 ea = va0 + simm + {29'd0, sk[0], 2'b00};
@@ -401,6 +482,12 @@ module ppc_exec #(
                             endcase
                             next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1;
                         end
+                    end
+                    10'd64: begin                                                    // mcrfs
+                        fp_impl = 1;
+                        cr_n[31 - 4*f_crfd -: 4] = fpscr[31 - 4*f_crfs -: 4];
+                        fp_mask[31 - 4*f_crfs -: 4] = 4'hF;
+                        fpscr_n = fpscr_fix(fpscr & ~(fp_mask & 32'h9FF8_0700));
                     end
                     10'd583: begin                                                   // mffs
                         fp_impl = 1; wa_en = 1; wa_idx = {1'b1, f_rt, sk[0]};
@@ -546,7 +633,17 @@ module ppc_exec #(
                             10'd512: begin cr_n[31 - 4*f_crfd -: 4] = xer[31:28];            // mcrxr
                                            xer_n[31:28] = 4'd0; end
                             10'd4:   trapc = trap_cond(va, vb, f_rt);                         // tw
-                            10'd535, 10'd567, 10'd663, 10'd695: fpu = 1;                      // lfsx, stfsx (not yet)
+                            10'd535, 10'd567: begin                                           // lfsx, lfsux
+                                fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2; ld = 1;
+                                ld_s2d = {1'b1, sk[0]}; wa_idx = {1'b1, f_rt, sk[0]};
+                                if (!sk[0]) begin next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1; end
+                                else if (xo10[5]) begin wb_en = 1; wb_val = ea; end
+                            end
+                            10'd663, 10'd695: begin                                           // stfsx, stfsux
+                                fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2; st = 1;
+                                st_data = ppc_pkg::dbl2sgl({vs, v_ms});
+                                if (xo10[5]) begin wb_en = 1; wb_val = ea; end
+                            end
                             10'd599, 10'd631, 10'd727, 10'd759: begin                         // lfdx(u), stfdx(u)
                                 fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2;
                                 ea = va0 + vb + {29'd0, sk[0], 2'b00};
@@ -614,6 +711,26 @@ module ppc_exec #(
             default: illegal = 1;
         endcase
 
+        // FP arithmetic, compares and conversions (see the step table above)
+        if (fp_arith) begin
+            fp_impl = 1'b1;
+            if (fp_3op && sk[1:0] == 2'd0) begin
+                fpt_we = 1'b1;
+                next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1;
+            end else if (fp_go) begin
+                fpscr_n = fpscr_upd;
+                if (fp_cmpi) cr_n[31 - 4*f_crfd -: 4] = fpu_cmp;
+                else begin
+                    if (f_rc) cr_n[27:24] = fpscr_upd[31:28];
+                    wa_en = 1'b1; wa_idx = {1'b1, f_rt, 1'b0}; wa_val = fpu_res[63:32];
+                    fplo_we = 1'b1;
+                    next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = sk + 7'd1;
+                end
+            end else begin
+                wa_en = 1'b1; wa_idx = {1'b1, f_rt, 1'b1}; wa_val = fp_lo;
+            end
+        end
+
         // An ordinary load or store that straddles a page boundary is done one
         // byte per step so each page is translated (and can fault) separately.
         // Loads collect the bytes in the hidden temporary register.
@@ -676,7 +793,7 @@ module ppc_exec #(
             wa_en = 1'b0; wb_en = 1'b0; ld = 1'b0; st = 1'b0;
             cr_n = cr; xer_n = xer; lr_n = lr; ctr_n = ctr; spr_we = 1'b0;
             ms_active_n = 1'b0; ms_reg_n = 7'd0; retire = 1'b1;
-            resv_set = 1'b0; resv_clr = 1'b0; fpscr_n = fpscr;
+            resv_set = 1'b0; resv_clr = 1'b0; fpscr_n = fpscr; fpt_we = 1'b0; fplo_we = 1'b0;
             ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0;
             srr_we = 1'b1;
             msr_n = msr & 32'h0000_1040;                             // keep ME and IP only
@@ -684,4 +801,7 @@ module ppc_exec #(
         end
     end
 
+    assign fpt_a = {va, vs};
+    assign fpt_b = {vb, v_ms};
+    assign fplo  = fpu_res[31:0];
 endmodule

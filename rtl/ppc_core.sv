@@ -46,6 +46,11 @@ module ppc_core #(
     // 64-127 the FPRs as 32-bit halves (64+2n high word, 65+2n low word).
     logic [31:0] gpr [128];
     logic [31:0] fpscr, fpscr_n;
+    logic [63:0] fp_a, fp_b, fpt_a, fpt_b;
+    logic [31:0] fp_lo, fplo;
+    logic        fpt_we, fplo_we;
+    logic [6:0]  ra_idx, rb_idx, rs_idx;
+    logic [1:0]  ld_s2d;
     // not cleared by reset (it will be block RAM); zeroed at time 0 for simulation
     initial for (int i = 0; i < 128; i++) gpr[i] = 32'd0;
     logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1;
@@ -100,16 +105,17 @@ module ppc_core #(
         .wk_busy, .wk_done, .wk_nf, .wk_re, .wk_we, .wk_addr, .wk_wdata, .wk_rdata(dmem_rdata),
         .spr_idx, .spr_rdata(xspr_rdata), .spr_rvalid(xspr_valid),
         .spr_we(spr_we & commit), .spr_wdata(spr_val),
-        .sr_idx, .sr_rdata, .sr_we(sr_we & commit), .sr_wdata(gpr[{2'b0, insn[25:21]}]),
-        .tlbie(tlbie & commit), .tlbie_ea(gpr[{2'b0, insn[15:11]}]),
+        .sr_idx, .sr_rdata, .sr_we(sr_we & commit), .sr_wdata(gpr[rs_idx]),
+        .tlbie(tlbie & commit), .tlbie_ea(gpr[rb_idx]),
         .dsi_we(dsi), .dsisr_in(d_fbits_x | (st ? 32'h0200_0000 : 32'h0)), .dar_in(ea)
     );
     wire [31:0] d_fbits_x = d_flt ? d_fbits : 32'h4000_0000;
 
     ppc_exec #(.PVR(PVR)) u_exec (
         .insn, .pc,
-        .va(gpr[{2'b0, insn[20:16]}]), .vb(gpr[{2'b0, insn[15:11]}]), .vs(gpr[{2'b0, insn[25:21]}]), .v_ms(gpr[ms_ridx]),
+        .va(gpr[ra_idx]), .vb(gpr[rb_idx]), .vs(gpr[rs_idx]), .v_ms(gpr[ms_ridx]),
         .ms_active, .ms_reg, .resv, .resv_addr, .fpscr, .fpscr_n,
+        .fp_a, .fp_b, .fp_lo, .fpt_we, .fpt_a, .fpt_b, .fplo_we, .fplo, .ra_idx, .rb_idx, .rs_idx, .ld_s2d,
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
@@ -124,7 +130,7 @@ module ppc_core #(
         .msize, .ea, .st_data
     );
 
-    wire [31:0] ld_val = ppc_pkg::ld_result(dmem_rdata, fsize, ld_sext, ld_brev, ld_mrg, ld_pos, ld_acc, wa_val);
+    wire [31:0] ld_val = ppc_pkg::ld_result(dmem_rdata, fsize, ld_sext, ld_brev, ld_mrg, ld_pos, ld_acc, wa_val, ld_s2d);
     wire        rf_we  = wa_en | ld;
     wire [31:0] rf_val = ld ? ld_val : wa_val;
     wire [31:0] dec_n  = (spr_we && commit && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
@@ -155,7 +161,7 @@ module ppc_core #(
             srr0 <= 0; srr1 <= 0; dec_r <= 32'hFFFF_FFFF; hid0 <= 0; hid1 <= 0;
             for (int i = 0; i < 4; i++) sprg[i] <= 0;
             fpscr <= 0;
-            resv <= 0; resv_addr <= 0;
+            resv <= 0; resv_addr <= 0; fp_a <= 0; fp_b <= 0; fp_lo <= 0;
             tb <= 0; dec_pend <= 0;
             ms_active <= 0; ms_reg <= 0;
             nf_i <= 0; nf_d <= 0;
@@ -198,6 +204,8 @@ module ppc_core #(
                 ms_active <= ms_active_n; ms_reg <= ms_reg_n;
                 if (resv_set) begin resv <= 1; resv_addr <= ea; end
                 if (resv_clr) resv <= 0;
+                if (fpt_we) begin fp_a <= fpt_a; fp_b <= fpt_b; end
+                if (fplo_we) fp_lo <= fplo;
                 if (retire && !exc) instret <= instret + 64'd1;
             end
         end

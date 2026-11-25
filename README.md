@@ -4,13 +4,13 @@ An open 32-bit PowerPC core (G3/750-class), with the long-term goal of booting
 classic Mac OS 9 on an FPGA. The design target is "what Mac OS accepts as a G3",
 not a clone of the real 750's out-of-order microarchitecture.
 
-## Status: phase 2 complete, Linux boots
+## Status: phases 2 and 3 done in simulation (Linux boots; FPU implemented)
 
 An unmodified Linux 6.8 kernel (plus a 90-line platform file, see `linux/`)
 boots on the pipelined core in simulation, mounts its initramfs, runs a small
 user-space program that makes system calls and sleeps on the timer, and powers
-off: about 21 million instructions, 29 million cycles, under 20 seconds of
-simulation. The console log is in `docs/linux-boot.log`. `make linux-test`
+off: about 21 million instructions and 29 million cycles. The user program
+also uses floating point, which exercises the kernel's lazy FPU switching. The console log is in `docs/linux-boot.log`. `make linux-test`
 boots the same image on QEMU's 750 and on the pipeline, compares what user
 space printed, and then runs the whole boot with the pipeline and the
 reference core in lockstep (22.8 million steps match).
@@ -30,6 +30,7 @@ Verification, all passing:
 |---|---|
 | `make test` | both cores vs QEMU (`qemu-ppc -cpu 750`) on the C/asm test programs, then pipeline vs reference in lockstep |
 | `make test` (supervisor part) | bare-metal exception tests on both cores vs full-system QEMU (`qemu-system-ppc -M 40p -cpu 750`), plus lockstep |
+| `make fprandtest` | random and boundary-directed floating-point programs: pipeline vs QEMU after every instruction, plus lockstep |
 | `make randtest` | random instruction programs (now including string ops, `dcbz`, `lwarx`/`stwcx.`): pipeline vs QEMU output, plus lockstep vs reference. 230 seeds x 2,000 instructions pass |
 
 Supervisor tests (`sw/sys/`): `exc` (every exception type, user mode), `irq`
@@ -38,7 +39,8 @@ table, R/C bits, protection, faults, tlbie, segment switch), `vm` (all code and
 data through the page table via two aliased mappings that keep evicting each
 other from the TLBs, with interrupts), `insn` (atomics, `dcbz`, string ops,
 page-crossing loads and stores including a missing second page), `fp` (FP
-register moves, load/store forms, FPSCR).
+register moves, load/store forms, FPSCR). `sw/tests/fp.c` is compiled C
+floating-point code (series, Newton iterations, conversions).
 
 The lockstep checker compares every retired step (PC, instruction, register
 writes, CR/XER/LR/CTR, store address/data) and prints the first divergence with
@@ -104,6 +106,60 @@ flag); exceptions do not clear the reservation.
 QEMU also lets code execute from a page with no read access (key=1, PP=00);
 g3core raises ISI as real hardware does.
 
+Floating point (`rtl/ppc_fpu.sv`, IEEE 754 with PowerPC semantics):
+- `fadd`/`fsub`/`fmul`/`fdiv` and the fused `fmadd`/`fmsub`/`fnmadd`/`fnmsub`,
+  each in double and single precision, exact with a single rounding
+- `frsp`, `fctiw`/`fctiwz`, `fcmpu`/`fcmpo`, `fsel`, `fmr`/`fneg`/`fabs`/`fnabs`
+- `lfs`/`stfs`/`lfd`/`stfd` in all addressing forms, `stfiwx`
+- FPSCR: all four rounding modes, the sticky exception bits (overflow,
+  underflow, zero-divide, inexact and the invalid-operation causes), FX/FEX/VX,
+  FI, the result class (FPRF), `mffs`/`mtfsf`/`mtfsfi`/`mtfsb0`/`mtfsb1`/`mcrfs`,
+  and the record (`.`) forms that copy FPSCR bits to CR1
+- the 32 FPRs live in the same register file as the GPRs as 32-bit halves; an
+  FP instruction takes 2 or 3 sequencer steps (operands, compute, second word)
+
+Checked with `make fprandtest`: random FP programs plus operands constructed to
+land on rounding ties, denormal and overflow boundaries, in all rounding modes,
+compared with QEMU after every instruction (result bits, FPSCR, CR). Over
+80,000 FP operations pass.
+
+FP limitations and known differences from QEMU 8.2:
+- `fres`, `frsqrte`, `fsqrt` are not implemented (program exception); the 750
+  has no `fsqrt`, and the two estimate instructions are rarely used.
+- Enabled FP exceptions do not trap (FE0/FE1 are stored but ignored) and the
+  result is always the "exception disabled" one.
+- FPSCR[FR] is implemented but unverified: QEMU does not model it, so the tests
+  mask it.
+- `fnmadd`/`fnmsub` round and then negate, as the architecture specifies. QEMU
+  negates before rounding, which differs in the two directed rounding modes.
+- FX is set only when an exception bit goes from 0 to 1 (QEMU sets it on every
+  exception); compares leave FI and the class bit C alone (QEMU rewrites them).
+- The upper word of an `fctiw` result and FPRF after an invalid conversion are
+  undefined by the architecture; g3core gives the same values as QEMU.
+- The FPU is one large combinational block (a 106-bit multiplier, a 224-bit
+  adder and a divider); it must become iterative before it can meet timing on
+  an FPGA, and it currently slows the Verilator model by about 3x.
+
+MMU (`rtl/ppc_mmu.sv`, shared by both cores):
+- 4 instruction + 4 data BATs, 16 segment registers (`mtsr`/`mfsr`/`mtsrin`/`mfsrin`), SDR1
+- hardware walk of the hashed page table (primary and secondary groups), with
+  Referenced/Changed bit updates written back to the page table
+- separate 64-entry direct-mapped instruction and data TLBs tagged by VSID, `tlbie`
+- protection keys (Ks/Kp with PP), no-execute segments
+- ISI (0x400) and DSI (0x300) with SRR1 / DSISR / DAR set as on the 750
+- in the pipeline, fetches that miss the TLB or fault travel as markers and are
+  resolved non-speculatively in EX; data addresses translate in EX; instructions
+  that change the translation context flush younger fetches
+
+MMU limitations: a misaligned `lmw`/`stmw` word that crosses a page boundary is
+translated by its first byte only; direct-store segments fault; a faulting
+multi-step instruction or page-crossing store may have completed part of its
+work (allowed by the architecture; QEMU completes none). `stwcx.` succeeds only
+at the address of the preceding `lwarx` (a real 750 checks just the reservation
+flag); exceptions do not clear the reservation.
+QEMU also lets code execute from a page with no read access (key=1, PP=00);
+g3core raises ISI as real hardware does.
+
 Floating point so far (the part an OS needs to manage FP state): the 32 FPRs,
 FPSCR, `lfd`/`stfd` in all addressing forms, `stfiwx`, `fmr`/`fneg`/`fabs`/
 `fnabs`, `mffs`/`mtfsf`/`mtfsfi`/`mtfsb0`/`mtfsb1`. FP arithmetic, compares,
@@ -111,14 +167,14 @@ conversions and single-precision load/store raise a program exception, so user
 programs that use floating point do not work yet. The FPRs live in the same
 register file as the GPRs as 32-bit halves.
 
-Not yet implemented: FP arithmetic, machine check, trace/single-step,
-alignment exception.
+Not yet implemented: machine check, trace/single-step, alignment exception.
 
 ## Layout
 
 ```
 rtl/ppc_pkg.sv      shared helpers
 rtl/ppc_exec.sv     decode + execute (combinational, shared by both cores)
+rtl/ppc_fpu.sv      floating-point unit
 rtl/ppc_mmu.sv      BATs, segments, TLBs, page table walker
 rtl/ppc_core.sv     single-cycle reference core
 rtl/ppc_pipe.sv     5-stage pipeline
@@ -128,6 +184,7 @@ sim/tb.cpp          Verilator driver (prints cycles, CPI, stalls, flushes)
 sim/tb_lockstep.cpp lockstep trace checker
 sw/rand/rand.c      driver for generated random tests
 tools/gen_random.py random instruction-sequence generator
+tools/gen_fprand.py random and boundary-directed floating-point test generator
 sw/common/          crt0 + exception vectors, handler framework (exc.h), linker script, tiny printf, backends
 sw/sys/             supervisor-mode tests (exceptions, user mode, interrupts)
 sw/tests/           test programs (C, plus optional same-named .S)
@@ -193,15 +250,14 @@ test passes when both produce identical output and exit codes.
 
 ## Next steps
 
-1. FPU (phase 3): arithmetic, compares, conversions, single-precision
-   load/store, FPSCR exception bits, checked against QEMU and IEEE test
-   vectors. Until then user space must avoid floating point.
-2. A fuller Linux user space as a harder test: BusyBox (soft-float) with a
-   shell, UART receive so the console is interactive, an external interrupt
+1. Hardware realism (phase 4): synchronous block-RAM memories with fetch and
+   load latency, caches, an iterative FPU and divider, a real-time time base,
+   split GPR/FPR register files, 2-way TLBs; then synthesis and FPGA bring-up
+   on an Artix-7 board.
+2. A fuller Linux user space as a harder test: BusyBox or a small glibc/musl
+   program set, UART receive for an interactive console, an external interrupt
    controller.
-3. Hardware realism (phase 4): synchronous block-RAM memories with fetch and
-   load latency, caches, a real-time time base, split the register file,
-   2-way TLBs, then FPGA bring-up on an Artix-7 board.
-4. Performance: branch target buffer (CPI is 1.34 on the Linux boot; branch
-   flushes and load-use stalls are the two visible costs).
+3. Remaining FP items: `fres`/`frsqrte`, enabled-exception traps, an FR check
+   against IEEE test vectors or real hardware.
+4. Performance: branch target buffer (CPI is 1.34 on the Linux boot).
 5. Mac OS 9 platform (phase 5).

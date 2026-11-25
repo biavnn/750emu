@@ -18,9 +18,9 @@ CFLAGS_BARE   := $(CFLAGS_COMMON) -ffreestanding -fno-builtin -msdata=none -G 0
 LDFLAGS_BARE  := -Wl,--build-id=none -nostdlib -nostartfiles -static -no-pie -T sw/common/link.ld
 CFLAGS_LINUX  := $(CFLAGS_COMMON) -static -no-pie
 
-RTL := rtl/ppc_pkg.sv rtl/ppc_exec.sv rtl/ppc_mmu.sv rtl/ppc_core.sv rtl/ppc_pipe.sv rtl/soc_top.sv
+RTL := rtl/ppc_pkg.sv rtl/ppc_fpu.sv rtl/ppc_exec.sv rtl/ppc_mmu.sv rtl/ppc_core.sv rtl/ppc_pipe.sv rtl/soc_top.sv
 
-.PHONY: all sim tests test run clean randtest linux-sim linux-test
+.PHONY: all sim tests test run clean randtest fprandtest linux-sim linux-test
 .SECONDARY:
 all: sim tests
 
@@ -117,3 +117,7 @@ N    ?= 50
 LEN  ?= 2000
 randtest: sim
 	tools/randtest.sh $(SEED) $(N) $(LEN)
+
+# Random floating-point tests: make fprandtest [SEED=1] [N=20] [LEN=1500]
+fprandtest: sim
+	GEN=tools/gen_fprand.py DRV=sw/rand/fprand.c TAG=fprand tools/randtest.sh $(SEED) $(N) $(LEN)

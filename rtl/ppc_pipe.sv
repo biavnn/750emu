@@ -68,6 +68,11 @@ module ppc_pipe #(
     // 64-127 the FPRs as 32-bit halves (64+2n high word, 65+2n low word).
     logic [31:0] gpr [128];
     logic [31:0] fpscr, fpscr_n;
+    logic [63:0] fp_a, fp_b, fpt_a, fpt_b;
+    logic [31:0] fp_lo, fplo;
+    logic        fpt_we, fplo_we;
+    logic [6:0]  ra_idx, rb_idx, rs_idx;
+    logic [1:0]  ld_s2d;
     // not cleared by reset (it will be block RAM); zeroed at time 0 for simulation
     initial for (int i = 0; i < 128; i++) gpr[i] = 32'd0;
     logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1;
@@ -92,7 +97,7 @@ module ppc_pipe #(
         logic        valid;
         logic [31:0] pc, insn;
         logic        rf_we, ld;  logic [6:0] rf_idx; logic [31:0] rf_val;
-        logic        mrg, acc;   logic [1:0] pos, fsize;
+        logic        mrg, acc;   logic [1:0] pos, fsize, s2d;
         logic        up_we;      logic [4:0] up_idx; logic [31:0] up_val;
         logic        st;         logic [31:0] ea, pa, st_data;
         logic [1:0]  size;       logic sext, brev;
@@ -158,9 +163,9 @@ module ppc_pipe #(
 
     logic [6:0] ms_ridx;
     logic       ms_ruse;
-    wire [31:0] e_va = fwd({2'b0, e_ra});
-    wire [31:0] e_vb = fwd({2'b0, e_rb});
-    wire [31:0] e_vs = fwd({2'b0, e_rs});
+    wire [31:0] e_va = fwd(ra_idx);
+    wire [31:0] e_vb = fwd(rb_idx);
+    wire [31:0] e_vs = fwd(rs_idx);
     wire [31:0] e_vm = fwd(ms_ridx);
 
     // Which GPR fields does the EX instruction actually read? (for load-use stalls)
@@ -173,6 +178,7 @@ module ppc_pipe #(
             6'd32, 6'd33, 6'd34, 6'd35, 6'd40, 6'd41, 6'd42, 6'd43,                // D-form loads
             6'd46, 6'd47: uses_rs = 0;                                             // lmw / stmw (stmw uses ms_cur)
             6'd23: uses_rb = 1;                                                    // rlwnm
+            6'd59, 6'd63: uses_rb = 1;                                             // FP: all ports may be read
             6'd31: begin
                 uses_rb = 1;
                 case (e_xo9)
@@ -191,8 +197,8 @@ module ppc_pipe #(
     end
 
     wire ld_use = e_valid && m.valid && m.ld &&
-                  ((uses_ra && m.rf_idx == {2'b0, e_ra}) || (uses_rb && m.rf_idx == {2'b0, e_rb}) ||
-                   (uses_rs && m.rf_idx == {2'b0, e_rs}) || (ms_ruse && m.rf_idx == ms_ridx));
+                  ((uses_ra && m.rf_idx == ra_idx) || (uses_rb && m.rf_idx == rb_idx) ||
+                   (uses_rs && m.rf_idx == rs_idx) || (ms_ruse && m.rf_idx == ms_ridx));
 
     // ------------------------------------------------------------------
     // EX: execute
@@ -213,6 +219,7 @@ module ppc_pipe #(
         .insn(e_insn), .pc(e_pc),
         .va(e_va), .vb(e_vb), .vs(e_vs), .v_ms(e_vm),
         .ms_active(e_ms_active), .ms_reg(e_ms_reg), .resv, .resv_addr, .fpscr, .fpscr_n,
+        .fp_a, .fp_b, .fp_lo, .fpt_we, .fpt_a, .fpt_b, .fplo_we, .fplo, .ra_idx, .rb_idx, .rs_idx, .ld_s2d,
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
@@ -270,7 +277,7 @@ module ppc_pipe #(
     assign dmem_we    = wk_busy ? wk_we    : m.valid && m.st;
     assign dmem_wdata = wk_busy ? wk_wdata : m.st_data;
 
-    wire [31:0] m_ld_val = ppc_pkg::ld_result(dmem_rdata, m.fsize, m.sext, m.brev, m.mrg, m.pos, m.acc, m.rf_val);
+    wire [31:0] m_ld_val = ppc_pkg::ld_result(dmem_rdata, m.fsize, m.sext, m.brev, m.mrg, m.pos, m.acc, m.rf_val, m.s2d);
 
     // ------------------------------------------------------------------
     // WB / trace
@@ -298,7 +305,7 @@ module ppc_pipe #(
             srr0 <= 0; srr1 <= 0; dec_r <= 32'hFFFF_FFFF; hid0 <= 0; hid1 <= 0;
             for (int i = 0; i < 4; i++) sprg[i] <= 0;
             fpscr <= 0;
-            resv <= 0; resv_addr <= 0;
+            resv <= 0; resv_addr <= 0; fp_a <= 0; fp_b <= 0; fp_lo <= 0;
             tb <= 0; dec_pend <= 0;
             instret <= 0; cycles <= 0; stall_ld_use <= 0; flush_branch <= 0;
         end else begin
@@ -325,7 +332,7 @@ module ppc_pipe #(
             m.up_we   <= wb_en & ~dsi;  m.up_idx <= e_ra;    m.up_val <= wb_val;
             m.st      <= st & ~dsi;  m.ea     <= ea;      m.pa <= d_pa;  m.st_data <= st_data;
             m.size    <= msize;      m.sext   <= ld_sext; m.brev    <= ld_brev;
-            m.mrg     <= ld_mrg;     m.pos    <= ld_pos;  m.acc     <= ld_acc;   m.fsize <= fsize;
+            m.mrg     <= ld_mrg;     m.pos    <= ld_pos;  m.acc     <= ld_acc;   m.fsize <= fsize;   m.s2d <= ld_s2d;
             m.retire  <= retire;
             m.cr  <= dsi ? cr  : cr_n;   m.xer <= dsi ? xer : xer_n;
             m.lr  <= dsi ? lr  : lr_n;   m.ctr <= dsi ? ctr : ctr_n;
@@ -364,6 +371,8 @@ module ppc_pipe #(
                 e_ms_reg    <= ms_reg_n;
                 if (resv_set) begin resv <= 1; resv_addr <= ea; end
                 if (resv_clr) resv <= 0;
+                if (fpt_we) begin fp_a <= fpt_a; fp_b <= fpt_b; end
+                if (fplo_we) fp_lo <= fplo;
             end
 
             // ---- front end ----

@@ -1,5 +1,4 @@
-// The whole of user space: a static program with no C library and no
-// floating point. It proves the kernel can run a process, take system calls
+// The whole of user space: a static program with no C library. It proves the kernel can run a process, take system calls
 // and keep time, then powers the machine off.
 typedef unsigned long ulong;
 
@@ -47,6 +46,16 @@ void _start(void)
 		put("init: Linux "); put(u.f[2]); put(" on "); put(u.f[4]); put("\n");
 	}
 	put("init: pid "); putn((ulong)sys(20, 0, 0, 0, 0)); put("\n");
+
+	/* floating point in user space: the first FP instruction traps and the
+	 * kernel gives this process the FPU */
+	{
+		volatile double two = 2.0;
+		double r = 1.0;
+		for (int i = 0; i < 30; i++)
+			r = 0.5 * (r + two / r);
+		put("init: sqrt(2) * 10^9 = "); putn((ulong)(r * 1e9)); put("\n");
+	}
 
 	sys(403, 1, (long)&t0, 0, 0);			/* clock_gettime64(CLOCK_MONOTONIC) */
 	for (int i = 1; i <= 3; i++) {

@@ -1,5 +1,5 @@
 [    0.000000] Total memory = 32MB; using 64kB for hash table
-[    0.000000] Linux version 6.8.12 (root@vm) (powerpc-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #6 Wed Nov 25 10:37:31 EST 2026 ()
+[    0.000000] Linux version 6.8.12 (root@vm) (powerpc-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #7 Wed Nov 25 11:32:03 EST 2026 ()
 [    0.000000] Hardware name: g3core simulation 740/750 0x80301 g3core
 [    0.000000] printk: legacy bootconsole [udbg0] enabled
 [    0.000000] -----------------------------------------------------
@@ -51,19 +51,20 @@
 [    8.636080] printk: legacy console [ttyS0] enabled
 [    8.650247] printk: legacy bootconsole [udbg0] disabled
 [    8.650247] printk: legacy bootconsole [udbg0] disabled
-[    8.815667] printk: legacy console [ttyS0] disabled
-[    8.903293] printk: legacy console [ttyS0] enabled
-[    8.968648] drmem: No dynamic reconfiguration memory found
-[    9.463145] Freeing unused kernel image (initmem) memory: 1124K
-[    9.470322] Kernel memory protection not selected by kernel config.
-[    9.474740] Run /init as init process
+[    8.814104] printk: legacy console [ttyS0] disabled
+[    8.901746] printk: legacy console [ttyS0] enabled
+[    8.965706] drmem: No dynamic reconfiguration memory found
+[    9.461618] Freeing unused kernel image (initmem) memory: 1124K
+[    9.468163] Kernel memory protection not selected by kernel config.
+[    9.472581] Run /init as init process
 
 init: hello from user space
 init: Linux 6.8.12 on ppc
 init: pid 1
+init: sqrt(2) * 10^9 = 1414213562
 init: tick 1
 init: tick 2
 init: tick 3
 init: slept at least 90 ms: yes
 <<EXIT 0>>
-[   10.278157] reboot: Power down
+[   10.268147] reboot: Power down

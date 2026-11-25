@@ -9,7 +9,7 @@ CROSS=${CROSS:-powerpc-linux-gnu-}
 mkdir -p "$OUT/kbuild"
 
 # 1. user space
-${CROSS}gcc -Os -mcpu=750 -msoft-float -ffreestanding -fno-builtin -fno-stack-protector -fno-pie \
+${CROSS}gcc -Os -mcpu=750 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie \
     -nostdlib -static -no-pie -Wl,--build-id=none -o "$OUT/init" "$HERE/init.c" -lgcc
 sed "s|@INIT@|$OUT/init|" "$HERE/initramfs.list" > "$OUT/initramfs.list"
 

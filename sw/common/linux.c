@@ -20,6 +20,8 @@ void texit(int code) {
     _exit(code);
 }
 
+void tlib_enable_fp(void) {}
+
 int main(void) {
     texit(test_main());
 }
