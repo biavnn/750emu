@@ -1,7 +1,10 @@
 // Two complete SoCs (reference core and pipeline), each with its own RAM,
 // running the same image. The C++ testbench compares their retire traces.
 // (port list mirrors soc_top; keep in sync)
-module lockstep_top (
+module lockstep_top #(
+    parameter int MEM_BYTES = 1 << 20,
+    parameter logic [31:0] RESET_PC = 32'h0000_0100
+) (
     input logic clk,
     input logic rst,
     output logic ref_done,
@@ -16,7 +19,7 @@ module lockstep_top (
     output logic [31:0] ref_tr_pc,
     output logic [31:0] ref_tr_insn,
     output logic ref_tr_rf_we,
-    output logic [4:0] ref_tr_rf_idx,
+    output logic [6:0] ref_tr_rf_idx,
     output logic [31:0] ref_tr_rf_val,
     output logic ref_tr_up_we,
     output logic [4:0] ref_tr_up_idx,
@@ -43,7 +46,7 @@ module lockstep_top (
     output logic [31:0] dut_tr_pc,
     output logic [31:0] dut_tr_insn,
     output logic dut_tr_rf_we,
-    output logic [4:0] dut_tr_rf_idx,
+    output logic [6:0] dut_tr_rf_idx,
     output logic [31:0] dut_tr_rf_val,
     output logic dut_tr_up_we,
     output logic [4:0] dut_tr_up_idx,
@@ -59,7 +62,7 @@ module lockstep_top (
     output logic [31:0] dut_tr_st_data,
     output logic [1:0] dut_tr_st_size
 );
-    soc_top #(.CORE(0), .QUIET(1)) ref_soc (
+    soc_top #(.CORE(0), .QUIET(1), .MEM_BYTES(MEM_BYTES), .RESET_PC(RESET_PC)) ref_soc (
         .clk, .rst,
         .done(ref_done),
         .exit_code(ref_exit_code),
@@ -89,7 +92,7 @@ module lockstep_top (
         .tr_st_data(ref_tr_st_data),
         .tr_st_size(ref_tr_st_size)
     );
-    soc_top #(.CORE(1), .QUIET(0)) dut_soc (
+    soc_top #(.CORE(1), .QUIET(0), .MEM_BYTES(MEM_BYTES), .RESET_PC(RESET_PC)) dut_soc (
         .clk, .rst,
         .done(dut_done),
         .exit_code(dut_exit_code),

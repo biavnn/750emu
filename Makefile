@@ -20,7 +20,7 @@ CFLAGS_LINUX  := $(CFLAGS_COMMON) -static -no-pie
 
 RTL := rtl/ppc_pkg.sv rtl/ppc_exec.sv rtl/ppc_mmu.sv rtl/ppc_core.sv rtl/ppc_pipe.sv rtl/soc_top.sv
 
-.PHONY: all sim tests test run clean randtest
+.PHONY: all sim tests test run clean randtest linux-sim linux-test
 .SECONDARY:
 all: sim tests
 
@@ -47,6 +47,21 @@ $(SIM1): $(RTL) sim/tb.cpp
 	$(call verilate,soc_top,-GCORE=1,sim/tb.cpp)
 $(LS): $(RTL) rtl/lockstep_top.sv sim/tb_lockstep.cpp
 	$(call verilate,lockstep_top,,rtl/lockstep_top.sv sim/tb_lockstep.cpp)
+
+# Linux-capable build of the pipeline: 32 MiB RAM, boots from the stub at 0x01F00000
+LSIM := $(BUILD)/linux/Vsoc_top
+$(LSIM): $(RTL) sim/tb.cpp
+	$(call verilate,soc_top,-GCORE=1 -GMEM_BYTES=33554432 -GRESET_PC=32\'h01F00000,sim/tb.cpp)
+LLS := $(BUILD)/linuxls/Vlockstep_top
+$(LLS): $(RTL) rtl/lockstep_top.sv sim/tb_lockstep.cpp
+	$(call verilate,lockstep_top,-GMEM_BYTES=33554432 -GRESET_PC=32\'h01F00000,rtl/lockstep_top.sv sim/tb_lockstep.cpp)
+linux-sim: $(LSIM) $(LLS)
+
+# Boot Linux: QEMU's 750 as reference, then the pipeline, then pipeline vs
+# reference core in lockstep. LINUX_OUT is the output directory of linux/build.sh.
+LINUX_OUT ?= ../linux-build/out
+linux-test: linux-sim
+	tools/linuxtest.sh $(LINUX_OUT) $(LSIM) $(LLS)
 
 # ---------------- software ----------------
 tests: $(foreach t,$(TESTS),$(BUILD)/sw/$(t).hex $(BUILD)/sw/$(t).linux) \

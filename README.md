@@ -4,7 +4,16 @@ An open 32-bit PowerPC core (G3/750-class), with the long-term goal of booting
 classic Mac OS 9 on an FPGA. The design target is "what Mac OS accepts as a G3",
 not a clone of the real 750's out-of-order microarchitecture.
 
-## Status: phase 2b in progress (integer ISA, exceptions and MMU done; Linux boot next)
+## Status: phase 2 complete, Linux boots
+
+An unmodified Linux 6.8 kernel (plus a 90-line platform file, see `linux/`)
+boots on the pipelined core in simulation, mounts its initramfs, runs a small
+user-space program that makes system calls and sleeps on the timer, and powers
+off: about 21 million instructions, 29 million cycles, under 20 seconds of
+simulation. The console log is in `docs/linux-boot.log`. `make linux-test`
+boots the same image on QEMU's 750 and on the pipeline, compares what user
+space printed, and then runs the whole boot with the pipeline and the
+reference core in lockstep (22.8 million steps match).
 
 Two cores share one execute unit (`rtl/ppc_exec.sv`), so they implement
 identical instruction semantics:
@@ -28,7 +37,8 @@ Supervisor tests (`sw/sys/`): `exc` (every exception type, user mode), `irq`
 table, R/C bits, protection, faults, tlbie, segment switch), `vm` (all code and
 data through the page table via two aliased mappings that keep evicting each
 other from the TLBs, with interrupts), `insn` (atomics, `dcbz`, string ops,
-page-crossing loads and stores including a missing second page).
+page-crossing loads and stores including a missing second page), `fp` (FP
+register moves, load/store forms, FPSCR).
 
 The lockstep checker compares every retired step (PC, instruction, register
 writes, CR/XER/LR/CTR, store address/data) and prints the first divergence with
@@ -94,8 +104,15 @@ flag); exceptions do not clear the reservation.
 QEMU also lets code execute from a page with no read access (key=1, PP=00);
 g3core raises ISI as real hardware does.
 
-Not yet implemented: FPU (FP instructions raise FP-unavailable or program
-exceptions), machine check, trace/single-step, alignment exception.
+Floating point so far (the part an OS needs to manage FP state): the 32 FPRs,
+FPSCR, `lfd`/`stfd` in all addressing forms, `stfiwx`, `fmr`/`fneg`/`fabs`/
+`fnabs`, `mffs`/`mtfsf`/`mtfsfi`/`mtfsb0`/`mtfsb1`. FP arithmetic, compares,
+conversions and single-precision load/store raise a program exception, so user
+programs that use floating point do not work yet. The FPRs live in the same
+register file as the GPRs as 32-bit halves.
+
+Not yet implemented: FP arithmetic, machine check, trace/single-step,
+alignment exception.
 
 ## Layout
 
@@ -119,6 +136,9 @@ tools/lockstep.sh   runs each test in lockstep
 tools/randtest.sh   generate, build and check random tests
 tools/systest.sh    supervisor tests: both cores vs QEMU system, plus lockstep
 tools/qemu_sys.py   runs a bare-metal ELF on QEMU's 750 (machine 40p), captures the UART
+linux/              Linux bring-up: platform file, device trees, boot stub, init, build script
+tools/linuxtest.sh  boots Linux on QEMU and both simulators and compares
+tools/linux_qemu.py runs the Linux image on QEMU's 750
 ```
 
 ## Usage
@@ -132,6 +152,25 @@ make test          # build everything; QEMU diff for both cores + lockstep
 make randtest      # 50 random programs (SEED=, N=, LEN= to change)
 make run T=hello   # run one program on the pipeline simulator
 ```
+
+### Linux
+
+```
+sudo apt install linux-source flex bison bc device-tree-compiler libssl-dev libelf-dev
+tar xf /usr/src/linux-source-6.8.0.tar.bz2 -C ..
+linux/build.sh ../linux-source-6.8.0 ../linux-build/out   # ~10 minutes on 2 cores
+make linux-test LINUX_OUT=../linux-build/out
+```
+
+`linux/build.sh` copies `linux/g3core.c` into the kernel tree as a new
+embedded6xx platform, configures from `tinyconfig` plus `linux/g3core.config`,
+builds `vmlinux` with `linux/init.c` as the only user-space program, and
+assembles a flat RAM image (kernel at 0, device tree at 0x01E00000, boot stub
+at 0x01F00000). The simulated SoC for Linux has 32 MiB of RAM and a
+transmit-only 16550 UART at 0xF0001000 used in polling mode; there is no
+interrupt controller, only the decrementer. In simulation the time base counts
+instructions, and the device tree declares 2 MHz, so "kernel time" is not wall
+time.
 
 Note: Verilator needs `-fno-case` (set in the Makefile); without it, 5.020
 expands the nested decode `case` statements into ~44 MB of C++ and runs out of memory.
@@ -147,22 +186,22 @@ test passes when both produce identical output and exit codes.
 | **0** (done) | Single-cycle integer reference core, differential tests vs QEMU |
 | **1** (done) | 5-stage in-order pipeline, forwarding, load-use interlock, static branch prediction, lockstep + random testing |
 | **2a** (done) | Exceptions: MSR, `sc`/`rfi`, program/trap/privilege, FP unavailable, decrementer + external interrupt, user mode |
-| **2b** (CPU side done) | BATs, segments, hardware page table walk, TLBs, DSI/ISI, atomics, `dcbz`, string ops, page-crossing accesses. Remaining: boot 32-bit Linux |
+| **2b** (done) | BATs, segments, hardware page table walk, TLBs, DSI/ISI, atomics, `dcbz`, string ops, page-crossing accesses, FP state instructions; Linux 6.8 boots to user space |
 | 3 | FPU: IEEE double, fused multiply-add, FPSCR; pass IEEE test vectors |
 | 4 | Caches, DDR3 (LiteDRAM), FPGA bring-up on Artix-7 |
 | 5 | mac99-style platform (OpenPIC, MacIO/KeyLargo subset, framebuffer + NDRV), OpenBIOS, Mac OS 9 |
 
-## Next steps (rest of phase 2b: Linux)
+## Next steps
 
-1. A minimal Linux platform in simulation: more RAM (the 1 MiB byte array
-   becomes a larger word-addressed or sparse model), a 16550-compatible UART so
-   the stock serial driver works, a flattened device tree, a small boot wrapper.
-2. Build a small 32-bit PowerPC kernel (hash MMU, no FPU use in kernel, math
-   emulation on) with an initramfs and boot it to a shell. Expect to find gaps:
-   any instruction or SPR the kernel touches that is still missing will show
-   up as a program exception with the instruction word in the log.
-3. Simulation speed for the boot: Verilator threads and tuning, or an
-   instruction-skipping fast-forward checked against QEMU.
-4. FPU (phase 3) can start in parallel: the kernel can run with FP emulation.
-5. Performance: branch target buffer, synchronous (BRAM-style) memories, caches,
-   2-way TLBs.
+1. FPU (phase 3): arithmetic, compares, conversions, single-precision
+   load/store, FPSCR exception bits, checked against QEMU and IEEE test
+   vectors. Until then user space must avoid floating point.
+2. A fuller Linux user space as a harder test: BusyBox (soft-float) with a
+   shell, UART receive so the console is interactive, an external interrupt
+   controller.
+3. Hardware realism (phase 4): synchronous block-RAM memories with fetch and
+   load latency, caches, a real-time time base, split the register file,
+   2-way TLBs, then FPGA bring-up on an Artix-7 board.
+4. Performance: branch target buffer (CPI is 1.34 on the Linux boot; branch
+   flushes and load-use stalls are the two visible costs).
+5. Mac OS 9 platform (phase 5).

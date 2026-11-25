@@ -1,0 +1,69 @@
+[    0.000000] Total memory = 32MB; using 64kB for hash table
+[    0.000000] Linux version 6.8.12 (root@vm) (powerpc-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #6 Wed Nov 25 10:37:31 EST 2026 ()
+[    0.000000] Hardware name: g3core simulation 740/750 0x80301 g3core
+[    0.000000] printk: legacy bootconsole [udbg0] enabled
+[    0.000000] -----------------------------------------------------
+[    0.000000] phys_mem_size     = 0x2000000
+[    0.000000] dcache_bsize      = 0x20
+[    0.000000] icache_bsize      = 0x20
+[    0.000000] cpu_features      = 0x000000000401a008
+[    0.000000]   possible        = 0x00000000277de008
+[    0.000000]   always          = 0x0000000000000000
+[    0.000000] cpu_user_features = 0x8c000001 0x00000000
+[    0.000000] mmu_features      = 0x00000001
+[    0.000000] Hash_size         = 0x10000
+[    0.000000] Hash_mask         = 0x3ff
+[    0.000000] -----------------------------------------------------
+[    0.000000] ioremap() called early from g3core_setup_arch+0x30/0x58. Use early_ioremap() instead
+[    0.000000] Zone ranges:
+[    0.000000]   Normal   [mem 0x0000000000000000-0x0000000001ffffff]
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000000000000-0x0000000001ffffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000000000000-0x0000000001ffffff]
+[    0.000000] Kernel command line: console=ttyS0,115200
+[    0.000000] Dentry cache hash table entries: 4096 (order: 2, 16384 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 2048 (order: 1, 8192 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 8128
+[    0.000000] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+[    0.000000] Kernel virtual memory layout:
+[    0.000000]   * 0xffbdf000..0xfffff000  : fixmap
+[    0.000000]   * 0xffbdd000..0xffbdf000  : early ioremap
+[    0.000000]   * 0xc3000000..0xffbdd000  : vmalloc & ioremap
+[    0.000000]   * 0xb0000000..0xc0000000  : modules
+[    0.000000] Memory: 28848K/32768K available (1392K kernel code, 496K rwdata, 328K rodata, 1124K init, 175K bss, 3920K reserved, 0K cma-reserved)
+[    0.000000] SLUB: HWalign=32, Order=0-1, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] NR_IRQS: 512, nr_irqs: 512, preallocated irqs: 16
+[    0.000905] clocksource: timebase: mask: 0xffffffffffffffff max_cycles: 0x1d854df40, max_idle_ns: 1763180808480 ns
+[    0.011792] clocksource: timebase mult[7d000000] shift[22] registered
+[    0.049555] Console: colour dummy device 80x25
+[    0.060377] pid_max: default: 4096 minimum: 301
+[    0.076802] Mount-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.088009] Mountpoint-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.264738] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+             
+[    0.406939] clocksource: Switched to clocksource timebase
+[    1.241917] workingset: timestamp_bits=30 max_order=13 bucket_order=0
+[    8.361287] Serial: 8250/16550 driver, 4 ports, IRQ sharing disabled
+[    8.547906] printk: legacy console [ttyS0] disabled
+[    8.621807] serial8250.0: ttyS0 at MMIO 0xf0001000 (irq = 0, base_baud = 115200) is a 16550A
+[    8.636080] printk: legacy console [ttyS0] enabled
+[    8.636080] printk: legacy console [ttyS0] enabled
+[    8.650247] printk: legacy bootconsole [udbg0] disabled
+[    8.650247] printk: legacy bootconsole [udbg0] disabled
+[    8.815667] printk: legacy console [ttyS0] disabled
+[    8.903293] printk: legacy console [ttyS0] enabled
+[    8.968648] drmem: No dynamic reconfiguration memory found
+[    9.463145] Freeing unused kernel image (initmem) memory: 1124K
+[    9.470322] Kernel memory protection not selected by kernel config.
+[    9.474740] Run /init as init process
+
+init: hello from user space
+init: Linux 6.8.12 on ppc
+init: pid 1
+init: tick 1
+init: tick 2
+init: tick 3
+init: slept at least 90 ms: yes
+<<EXIT 0>>
+[   10.278157] reboot: Power down

@@ -16,7 +16,7 @@
 
 module ppc_core #(
     parameter logic [31:0] RESET_PC = 32'h0000_0100,
-    parameter logic [31:0] PVR      = 32'h0008_0200
+    parameter logic [31:0] PVR      = 32'h0008_0301
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -34,7 +34,7 @@ module ppc_core #(
     // retire trace: describes the step that commits at the next clock edge
     output logic        tr_valid,
     output logic [31:0] tr_pc, tr_insn,
-    output logic        tr_rf_we,  output logic [4:0] tr_rf_idx, output logic [31:0] tr_rf_val,
+    output logic        tr_rf_we,  output logic [6:0] tr_rf_idx, output logic [31:0] tr_rf_val,
     output logic        tr_up_we,  output logic [4:0] tr_up_idx, output logic [31:0] tr_up_val,
     output logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr, tr_msr,
     output logic        tr_exc,
@@ -42,7 +42,12 @@ module ppc_core #(
     output logic [1:0]  tr_st_size
 );
     logic [31:0] pc;
-    logic [31:0] gpr [33];          // [32] = hidden temporary for page-crossing loads
+    // Register file: 0-31 GPRs, 32 hidden temporary (page-crossing loads),
+    // 64-127 the FPRs as 32-bit halves (64+2n high word, 65+2n low word).
+    logic [31:0] gpr [128];
+    logic [31:0] fpscr, fpscr_n;
+    // not cleared by reset (it will be block RAM); zeroed at time 0 for simulation
+    initial for (int i = 0; i < 128; i++) gpr[i] = 32'd0;
     logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1;
     logic [31:0] sprg [4];
     logic [63:0] tb;
@@ -66,7 +71,7 @@ module ppc_core #(
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
     logic        take_int, ctx_sync, sr_we, tlbie;
     logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, ms_ruse, resv_set, resv_clr;
-    logic [5:0]  wa_idx, ms_ridx;
+    logic [6:0]  wa_idx, ms_ridx;
     logic [6:0]  ms_reg_n;
     logic [1:0]  ld_pos, fsize;
     logic [9:0]  spr_idx;
@@ -95,16 +100,16 @@ module ppc_core #(
         .wk_busy, .wk_done, .wk_nf, .wk_re, .wk_we, .wk_addr, .wk_wdata, .wk_rdata(dmem_rdata),
         .spr_idx, .spr_rdata(xspr_rdata), .spr_rvalid(xspr_valid),
         .spr_we(spr_we & commit), .spr_wdata(spr_val),
-        .sr_idx, .sr_rdata, .sr_we(sr_we & commit), .sr_wdata(gpr[insn[25:21]]),
-        .tlbie(tlbie & commit), .tlbie_ea(gpr[insn[15:11]]),
+        .sr_idx, .sr_rdata, .sr_we(sr_we & commit), .sr_wdata(gpr[{2'b0, insn[25:21]}]),
+        .tlbie(tlbie & commit), .tlbie_ea(gpr[{2'b0, insn[15:11]}]),
         .dsi_we(dsi), .dsisr_in(d_fbits_x | (st ? 32'h0200_0000 : 32'h0)), .dar_in(ea)
     );
     wire [31:0] d_fbits_x = d_flt ? d_fbits : 32'h4000_0000;
 
     ppc_exec #(.PVR(PVR)) u_exec (
         .insn, .pc,
-        .va(gpr[insn[20:16]]), .vb(gpr[insn[15:11]]), .vs(gpr[insn[25:21]]), .v_ms(gpr[ms_ridx]),
-        .ms_active, .ms_reg, .resv, .resv_addr,
+        .va(gpr[{2'b0, insn[20:16]}]), .vb(gpr[{2'b0, insn[15:11]}]), .vs(gpr[{2'b0, insn[25:21]}]), .v_ms(gpr[ms_ridx]),
+        .ms_active, .ms_reg, .resv, .resv_addr, .fpscr, .fpscr_n,
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
@@ -135,7 +140,7 @@ module ppc_core #(
     assign tr_valid   = step;
     assign tr_pc      = pc;
     assign tr_insn    = insn;
-    assign tr_rf_we   = rf_we & ~dsi & ~wa_idx[5];  assign tr_rf_idx = wa_idx[4:0];      assign tr_rf_val = rf_val;
+    assign tr_rf_we   = rf_we & ~dsi;  assign tr_rf_idx = wa_idx;      assign tr_rf_val = rf_val;
     assign tr_up_we   = wb_en & ~dsi;  assign tr_up_idx = insn[20:16]; assign tr_up_val = wb_val;
     assign tr_cr  = dsi ? cr  : cr_n;  assign tr_xer = dsi ? xer : xer_n;
     assign tr_lr  = dsi ? lr  : lr_n;  assign tr_ctr = dsi ? ctr : ctr_n;
@@ -149,7 +154,7 @@ module ppc_core #(
             cr <= 0; xer <= 0; lr <= 0; ctr <= 0; msr <= 0;
             srr0 <= 0; srr1 <= 0; dec_r <= 32'hFFFF_FFFF; hid0 <= 0; hid1 <= 0;
             for (int i = 0; i < 4; i++) sprg[i] <= 0;
-            for (int i = 0; i < 33; i++) gpr[i] <= 0;
+            fpscr <= 0;
             resv <= 0; resv_addr <= 0;
             tb <= 0; dec_pend <= 0;
             ms_active <= 0; ms_reg <= 0;
@@ -176,8 +181,8 @@ module ppc_core #(
                 ms_active <= 0; ms_reg <= 0;
             end else if (commit) begin
                 pc  <= next_pc;
-                cr  <= cr_n;  xer <= xer_n;  lr <= lr_n;  ctr <= ctr_n;  msr <= msr_n;
-                if (wb_en) gpr[insn[20:16]] <= wb_val;
+                cr  <= cr_n;  xer <= xer_n;  lr <= lr_n;  ctr <= ctr_n;  msr <= msr_n;  fpscr <= fpscr_n;
+                if (wb_en) gpr[{2'b0, insn[20:16]}] <= wb_val;
                 if (rf_we) gpr[wa_idx] <= rf_val;   // load result wins over update (invalid form)
                 if (spr_we) case (spr_idx)
                     10'd26:  srr0 <= spr_val;

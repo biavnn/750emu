@@ -34,7 +34,7 @@
 
 module ppc_pipe #(
     parameter logic [31:0] RESET_PC = 32'h0000_0100,
-    parameter logic [31:0] PVR      = 32'h0008_0200
+    parameter logic [31:0] PVR      = 32'h0008_0301
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -51,7 +51,7 @@ module ppc_pipe #(
     output logic [63:0] cycles,
     output logic        tr_valid,
     output logic [31:0] tr_pc, tr_insn,
-    output logic        tr_rf_we,  output logic [4:0] tr_rf_idx, output logic [31:0] tr_rf_val,
+    output logic        tr_rf_we,  output logic [6:0] tr_rf_idx, output logic [31:0] tr_rf_val,
     output logic        tr_up_we,  output logic [4:0] tr_up_idx, output logic [31:0] tr_up_val,
     output logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr, tr_msr,
     output logic        tr_exc,
@@ -64,7 +64,12 @@ module ppc_pipe #(
     // ------------------------------------------------------------------
     // Architectural state
     // ------------------------------------------------------------------
-    logic [31:0] gpr [33];          // [32] = hidden temporary for page-crossing loads
+    // Register file: 0-31 GPRs, 32 hidden temporary (page-crossing loads),
+    // 64-127 the FPRs as 32-bit halves (64+2n high word, 65+2n low word).
+    logic [31:0] gpr [128];
+    logic [31:0] fpscr, fpscr_n;
+    // not cleared by reset (it will be block RAM); zeroed at time 0 for simulation
+    initial for (int i = 0; i < 128; i++) gpr[i] = 32'd0;
     logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1;
     logic [31:0] sprg [4];
     logic [63:0] tb;
@@ -86,7 +91,7 @@ module ppc_pipe #(
     typedef struct packed {
         logic        valid;
         logic [31:0] pc, insn;
-        logic        rf_we, ld;  logic [5:0] rf_idx; logic [31:0] rf_val;
+        logic        rf_we, ld;  logic [6:0] rf_idx; logic [31:0] rf_val;
         logic        mrg, acc;   logic [1:0] pos, fsize;
         logic        up_we;      logic [4:0] up_idx; logic [31:0] up_val;
         logic        st;         logic [31:0] ea, pa, st_data;
@@ -143,19 +148,19 @@ module ppc_pipe #(
     wire [9:0] e_xo10 = e_insn[10:1];
     wire [8:0] e_xo9  = e_insn[9:1];
 
-    function automatic logic [31:0] fwd(input logic [5:0] idx);
+    function automatic logic [31:0] fwd(input logic [6:0] idx);
         if      (m.valid && m.rf_we && !m.ld && m.rf_idx == idx) fwd = m.rf_val;
-        else if (m.valid && m.up_we && {1'b0, m.up_idx} == idx)  fwd = m.up_val;
+        else if (m.valid && m.up_we && {2'b0, m.up_idx} == idx)  fwd = m.up_val;
         else if (w.valid && w.rf_we && w.rf_idx == idx)          fwd = w.rf_val;
-        else if (w.valid && w.up_we && {1'b0, w.up_idx} == idx)  fwd = w.up_val;
+        else if (w.valid && w.up_we && {2'b0, w.up_idx} == idx)  fwd = w.up_val;
         else                                                     fwd = gpr[idx];
     endfunction
 
-    logic [5:0] ms_ridx;
+    logic [6:0] ms_ridx;
     logic       ms_ruse;
-    wire [31:0] e_va = fwd({1'b0, e_ra});
-    wire [31:0] e_vb = fwd({1'b0, e_rb});
-    wire [31:0] e_vs = fwd({1'b0, e_rs});
+    wire [31:0] e_va = fwd({2'b0, e_ra});
+    wire [31:0] e_vb = fwd({2'b0, e_rb});
+    wire [31:0] e_vs = fwd({2'b0, e_rs});
     wire [31:0] e_vm = fwd(ms_ridx);
 
     // Which GPR fields does the EX instruction actually read? (for load-use stalls)
@@ -186,8 +191,8 @@ module ppc_pipe #(
     end
 
     wire ld_use = e_valid && m.valid && m.ld &&
-                  ((uses_ra && m.rf_idx == {1'b0, e_ra}) || (uses_rb && m.rf_idx == {1'b0, e_rb}) ||
-                   (uses_rs && m.rf_idx == {1'b0, e_rs}) || (ms_ruse && m.rf_idx == ms_ridx));
+                  ((uses_ra && m.rf_idx == {2'b0, e_ra}) || (uses_rb && m.rf_idx == {2'b0, e_rb}) ||
+                   (uses_rs && m.rf_idx == {2'b0, e_rs}) || (ms_ruse && m.rf_idx == ms_ridx));
 
     // ------------------------------------------------------------------
     // EX: execute
@@ -198,7 +203,7 @@ module ppc_pipe #(
     logic        take_int, ctx_sync, sr_we, tlbie;
     logic [3:0]  sr_idx;
     logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, resv_set, resv_clr;
-    logic [5:0]  wa_idx;
+    logic [6:0]  wa_idx;
     logic [6:0]  ms_reg_n;
     logic [1:0]  ld_pos, fsize;
     logic [9:0]  spr_idx;
@@ -207,7 +212,7 @@ module ppc_pipe #(
     ppc_exec #(.PVR(PVR)) u_exec (
         .insn(e_insn), .pc(e_pc),
         .va(e_va), .vb(e_vb), .vs(e_vs), .v_ms(e_vm),
-        .ms_active(e_ms_active), .ms_reg(e_ms_reg), .resv, .resv_addr,
+        .ms_active(e_ms_active), .ms_reg(e_ms_reg), .resv, .resv_addr, .fpscr, .fpscr_n,
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
@@ -272,7 +277,7 @@ module ppc_pipe #(
     // ------------------------------------------------------------------
     assign tr_valid  = w.valid;
     assign tr_pc     = w.pc;      assign tr_insn   = w.insn;
-    assign tr_rf_we  = w.rf_we & ~w.rf_idx[5];   assign tr_rf_idx = w.rf_idx[4:0];  assign tr_rf_val = w.rf_val;
+    assign tr_rf_we  = w.rf_we;   assign tr_rf_idx = w.rf_idx;  assign tr_rf_val = w.rf_val;
     assign tr_up_we  = w.up_we;   assign tr_up_idx = w.up_idx;  assign tr_up_val = w.up_val;
     assign tr_cr = w.cr; assign tr_xer = w.xer; assign tr_lr = w.lr; assign tr_ctr = w.ctr;
     assign tr_msr = w.msr; assign tr_exc = w.exc;
@@ -292,7 +297,7 @@ module ppc_pipe #(
             cr <= 0; xer <= 0; lr <= 0; ctr <= 0; msr <= 0;
             srr0 <= 0; srr1 <= 0; dec_r <= 32'hFFFF_FFFF; hid0 <= 0; hid1 <= 0;
             for (int i = 0; i < 4; i++) sprg[i] <= 0;
-            for (int i = 0; i < 33; i++) gpr[i] <= 0;
+            fpscr <= 0;
             resv <= 0; resv_addr <= 0;
             tb <= 0; dec_pend <= 0;
             instret <= 0; cycles <= 0; stall_ld_use <= 0; flush_branch <= 0;
@@ -303,7 +308,7 @@ module ppc_pipe #(
 
             // ---- WB ----
             if (w.valid) begin
-                if (w.up_we) gpr[w.up_idx] <= w.up_val;
+                if (w.up_we) gpr[{2'b0, w.up_idx}] <= w.up_val;
                 if (w.rf_we) gpr[w.rf_idx] <= w.rf_val;
                 if (w.retire && !w.exc) instret <= instret + 64'd1;
             end
@@ -343,7 +348,7 @@ module ppc_pipe #(
                 msr  <= ppc_pkg::exc_msr(msr);
                 e_ms_active <= 0; e_ms_reg <= 0;
             end else if (ex_commit) begin
-                cr <= cr_n; xer <= xer_n; lr <= lr_n; ctr <= ctr_n; msr <= msr_n;
+                cr <= cr_n; xer <= xer_n; lr <= lr_n; ctr <= ctr_n; msr <= msr_n; fpscr <= fpscr_n;
                 if (spr_we) case (spr_idx)
                     10'd26:  srr0 <= spr_val;
                     10'd27:  srr1 <= spr_val;

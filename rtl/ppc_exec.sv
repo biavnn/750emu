@@ -9,7 +9,7 @@
 // Here IBM bit i is [31-i].
 
 module ppc_exec #(
-    parameter logic [31:0] PVR = 32'h0008_0200
+    parameter logic [31:0] PVR = 32'h0008_0301   // 750 v3.1
 ) (
     input  logic [31:0] insn,
     input  logic [31:0] pc,
@@ -21,13 +21,15 @@ module ppc_exec #(
     input  logic [6:0]  ms_reg,    //   its step counter (register number for lmw/stmw)
     input  logic        resv,      // reservation from lwarx
     input  logic [31:0] resv_addr,
+    input  logic [31:0] fpscr,
+    output logic [31:0] fpscr_n,
     input  logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1,
     input  logic [31:0] sprg0, sprg1, sprg2, sprg3,
     input  logic [63:0] tb,
 
     output logic [31:0] next_pc,
     output logic        wa_en,      // non-load GPR result
-    output logic [5:0]  wa_idx,     // destination for result or load data (32 = hidden temporary)
+    output logic [6:0]  wa_idx,     // destination: 0-31 GPR, 32 hidden temporary, 64+2n / 65+2n = FPR n high / low word
     output logic [31:0] wa_val,
     output logic        wb_en,      // RA <- EA (update forms)
     output logic [31:0] wb_val,
@@ -55,7 +57,7 @@ module ppc_exec #(
     output logic        retire,     // 0 for non-final steps of a multi-step instruction
     output logic        ms_active_n,
     output logic [6:0]  ms_reg_n,
-    output logic [5:0]  ms_ridx,    // register the sequencer reads this step (v_ms)
+    output logic [6:0]  ms_ridx,    // register the sequencer reads this step (v_ms)
     output logic        ms_ruse,    //   and whether it may be read at all
     output logic        ld, st, ld_sext, ld_brev,
     output logic        ld_mrg,     // string load: merge byte into wa_val at ld_pos
@@ -79,7 +81,8 @@ module ppc_exec #(
     logic [1:0]  ck;
     logic [6:0]  sk, sn;
     logic [4:0]  ms_cur;
-    logic        msr_we, illegal, priv, trapc, fpu, sc_c, rfi_c;
+    logic        msr_we, illegal, priv, trapc, fpu, fp_impl, sc_c, rfi_c;
+    logic [31:0] fp_mask;
     logic [19:0] exc_vec;
     wire         pr = msr[14];
     logic        rec_en; logic [31:0] rec_val;   // Rc=1 -> CR0
@@ -115,8 +118,27 @@ module ppc_exec #(
     wire is_str = (opcd == 6'd31) && (xo10 == 10'd597 || xo10 == 10'd533 || xo10 == 10'd725 || xo10 == 10'd661);
     assign sk      = ms_active ? ms_reg : 7'd0;
     assign ms_cur  = ms_active ? ms_reg[4:0] : f_rt;
-    assign ms_ridx = is_mw ? {1'b0, ms_cur} : is_str ? {1'b0, f_rt + sk[6:2]} : 6'd32;
-    assign ms_ruse = ms_active | is_mw | is_str;
+    //   FP stores and moves: the source FPR word.
+    wire is_fpst = (opcd == 6'd54 || opcd == 6'd55) ||
+                   (opcd == 6'd31 && (xo10 == 10'd727 || xo10 == 10'd759));
+    wire is_fiw  = (opcd == 6'd31 && xo10 == 10'd983);
+    wire is_fpmv = (opcd == 6'd63) && (xo10 == 10'd72 || xo10 == 10'd40 || xo10 == 10'd264 || xo10 == 10'd136);
+    wire is_mtfsf = (opcd == 6'd63) && (xo10 == 10'd711);
+    assign ms_ridx = is_mw    ? {2'b0, ms_cur} :
+                     is_str   ? {2'b0, f_rt + sk[6:2]} :
+                     is_fpst  ? {1'b1, f_rt, sk[0]} :
+                     is_fiw   ? {1'b1, f_rt, 1'b1} :
+                     is_fpmv  ? {1'b1, f_rb, sk[0]} :
+                     is_mtfsf ? {1'b1, f_rb, 1'b1} : 7'd32;
+    assign ms_ruse = ms_active | is_mw | is_str | is_fpst | is_fiw | is_fpmv | is_mtfsf;
+
+    // FPSCR: FEX and VX are summaries of other bits
+    function automatic logic [31:0] fpscr_fix(input logic [31:0] v);
+        logic vx, fex;
+        vx  = |v[24:19] | |v[10:8];
+        fex = (vx & v[7]) | (v[28] & v[6]) | (v[27] & v[5]) | (v[26] & v[4]) | (v[25] & v[3]);
+        fpscr_fix = {v[31], fex, vx, v[28:12], 1'b0, v[10:0]};   // bit 11 is reserved
+    endfunction
 
     assign spr_idx = f_spr;
     assign sr_idx  = (opcd == 6'd31 && (xo10 == 10'd242 || xo10 == 10'd659)) ? vb[31:28] : insn[19:16];
@@ -237,7 +259,7 @@ module ppc_exec #(
 
     always_comb begin
         next_pc = pc + 32'd4;
-        wa_en = 1'b0; wa_idx = {1'b0, f_rt}; wa_val = 32'd0;
+        wa_en = 1'b0; wa_idx = {2'b0, f_rt}; wa_val = 32'd0;
         nonplain = 1'b0; ld_mrg = 1'b0; ld_pos = 2'd0; ld_acc = 1'b0;
         resv_set = 1'b0; resv_clr = 1'b0;
         sn = 7'd0;
@@ -247,7 +269,7 @@ module ppc_exec #(
         oe_en = 1'b0; oe_ov = 1'b0;
         spr_we = 1'b0; spr_val = vs;
         msr_we = 1'b0;
-        illegal = 1'b0; priv = 1'b0; trapc = 1'b0; fpu = 1'b0; sc_c = 1'b0; rfi_c = 1'b0;
+        illegal = 1'b0; priv = 1'b0; trapc = 1'b0; fpu = 1'b0; fp_impl = 1'b0; fpscr_n = fpscr; fp_mask = 32'd0; sc_c = 1'b0; rfi_c = 1'b0;
         ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0;
         retire = 1'b1;
         ms_active_n = 1'b0; ms_reg_n = 7'd0;
@@ -269,28 +291,28 @@ module ppc_exec #(
 
             // ---------------- immediate logical ----------------
             // (RS is in the RT field; the destination is RA)
-            6'd24: begin wa_en = 1; wa_idx = {1'b0, f_ra}; wa_val = vs | uimm; end                  // ori
-            6'd25: begin wa_en = 1; wa_idx = {1'b0, f_ra}; wa_val = vs | {insn[15:0], 16'd0}; end   // oris
-            6'd26: begin wa_en = 1; wa_idx = {1'b0, f_ra}; wa_val = vs ^ uimm; end                  // xori
-            6'd27: begin wa_en = 1; wa_idx = {1'b0, f_ra}; wa_val = vs ^ {insn[15:0], 16'd0}; end   // xoris
-            6'd28: begin wa_en = 1; wa_idx = {1'b0, f_ra}; wa_val = vs & uimm;                      // andi.
+            6'd24: begin wa_en = 1; wa_idx = {2'b0, f_ra}; wa_val = vs | uimm; end                  // ori
+            6'd25: begin wa_en = 1; wa_idx = {2'b0, f_ra}; wa_val = vs | {insn[15:0], 16'd0}; end   // oris
+            6'd26: begin wa_en = 1; wa_idx = {2'b0, f_ra}; wa_val = vs ^ uimm; end                  // xori
+            6'd27: begin wa_en = 1; wa_idx = {2'b0, f_ra}; wa_val = vs ^ {insn[15:0], 16'd0}; end   // xoris
+            6'd28: begin wa_en = 1; wa_idx = {2'b0, f_ra}; wa_val = vs & uimm;                      // andi.
                          rec_en = 1; rec_val = vs & uimm; end
-            6'd29: begin wa_en = 1; wa_idx = {1'b0, f_ra}; wa_val = vs & {insn[15:0], 16'd0};       // andis.
+            6'd29: begin wa_en = 1; wa_idx = {2'b0, f_ra}; wa_val = vs & {insn[15:0], 16'd0};       // andis.
                          rec_en = 1; rec_val = vs & {insn[15:0], 16'd0}; end
 
             // ---------------- rotates ----------------
             6'd21: begin                                                             // rlwinm
-                wa_en = 1; wa_idx = {1'b0, f_ra};
+                wa_en = 1; wa_idx = {2'b0, f_ra};
                 wa_val = rotl32(vs, f_rb) & ppc_mask(f_mb, f_me);
                 rec_en = f_rc; rec_val = wa_val;
             end
             6'd23: begin                                                             // rlwnm
-                wa_en = 1; wa_idx = {1'b0, f_ra};
+                wa_en = 1; wa_idx = {2'b0, f_ra};
                 wa_val = rotl32(vs, vb[4:0]) & ppc_mask(f_mb, f_me);
                 rec_en = f_rc; rec_val = wa_val;
             end
             6'd20: begin                                                             // rlwimi
-                wa_en = 1; wa_idx = {1'b0, f_ra};
+                wa_en = 1; wa_idx = {2'b0, f_ra};
                 wa_val = (rotl32(vs, f_rb) & ppc_mask(f_mb, f_me)) | (va & ~ppc_mask(f_mb, f_me));
                 rec_en = f_rc; rec_val = wa_val;
             end
@@ -339,7 +361,7 @@ module ppc_exec #(
             6'd44, 6'd45: begin st = 1; msize = 2'd1; upd = opcd[0]; end             // sth(u)
             6'd46, 6'd47: begin                                                      // lmw / stmw
                 ea = ms_ea; nonplain = 1;
-                if (opcd == 6'd46) begin ld = 1; wa_idx = {1'b0, ms_cur}; end
+                if (opcd == 6'd46) begin ld = 1; wa_idx = {2'b0, ms_cur}; end
                 else begin st = 1; st_data = v_ms; end
                 if (ms_cur != 5'd31) begin
                     next_pc = pc; retire = 1'b0;
@@ -353,7 +375,57 @@ module ppc_exec #(
 
             // floating point: not implemented yet. With MSR[FP]=0 these raise
             // "FP unavailable" exactly like a real CPU, so an OS can emulate them.
-            6'd48, 6'd49, 6'd50, 6'd51, 6'd52, 6'd53, 6'd54, 6'd55, 6'd59, 6'd63: fpu = 1;
+            // Implemented so far: the FPR file with double load/store, register
+            // moves and FPSCR access (what an OS needs to save/restore FP state).
+            // Arithmetic and single-precision forms raise a program exception.
+            6'd48, 6'd49, 6'd52, 6'd53, 6'd59: fpu = 1;
+            6'd50, 6'd51, 6'd54, 6'd55: begin                                        // lfd(u), stfd(u)
+                fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2;
+                ea = va0 + simm + {29'd0, sk[0], 2'b00};
+                if (!opcd[2]) begin ld = 1; wa_idx = {1'b1, f_rt, sk[0]}; end
+                else begin st = 1; st_data = v_ms; end
+                if (!sk[0]) begin next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1; end
+                else if (opcd[0]) begin wb_en = 1; wb_val = va0 + simm; end
+            end
+            6'd63: begin
+                fpu = 1;
+                if (!f_rc) case (xo10)
+                    10'd72, 10'd40, 10'd264, 10'd136: begin                          // fmr, fneg, fabs, fnabs
+                        fp_impl = 1; wa_en = 1; wa_idx = {1'b1, f_rt, sk[0]}; wa_val = v_ms;
+                        if (!sk[0]) begin
+                            case (xo10)
+                                10'd40:  wa_val[31] = ~v_ms[31];
+                                10'd264: wa_val[31] = 1'b0;
+                                10'd136: wa_val[31] = 1'b1;
+                                default: ;
+                            endcase
+                            next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1;
+                        end
+                    end
+                    10'd583: begin                                                   // mffs
+                        fp_impl = 1; wa_en = 1; wa_idx = {1'b1, f_rt, sk[0]};
+                        wa_val = sk[0] ? fpscr : 32'd0;
+                        if (!sk[0]) begin next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1; end
+                    end
+                    10'd711: begin                                                   // mtfsf
+                        fp_impl = 1;
+                        for (int i = 0; i < 8; i++) if (insn[24 - i]) fp_mask[31 - 4*i -: 4] = 4'hF;
+                        fp_mask[30:29] = 2'b00;
+                        fpscr_n = fpscr_fix((fpscr & ~fp_mask) | (v_ms & fp_mask));
+                    end
+                    10'd134: begin                                                   // mtfsfi
+                        fp_impl = 1;
+                        fp_mask[31 - 4*f_crfd -: 4] = 4'hF; fp_mask[30:29] = 2'b00;
+                        fpscr_n = fpscr_fix((fpscr & ~fp_mask) | ({8{insn[15:12]}} & fp_mask));
+                    end
+                    10'd70, 10'd38: begin                                            // mtfsb0, mtfsb1
+                        fp_impl = 1;
+                        fp_mask[5'd31 - f_rt] = 1'b1; fp_mask[30:29] = 2'b00;
+                        fpscr_n = fpscr_fix(xo10 == 10'd38 ? (fpscr | fp_mask) : (fpscr & ~fp_mask));
+                    end
+                    default: ;
+                endcase
+            end
 
             6'd31: begin
                 ea = va0 + vb;
@@ -390,7 +462,7 @@ module ppc_exec #(
                             10'd28, 10'd60, 10'd444, 10'd124, 10'd316, 10'd476, 10'd284,
                             10'd412, 10'd24, 10'd536, 10'd792, 10'd824, 10'd26, 10'd954,
                             10'd922: begin
-                                wa_en = 1; wa_idx = {1'b0, f_ra};
+                                wa_en = 1; wa_idx = {2'b0, f_ra};
                                 case (xo10)
                                     10'd28:  wa_val = vs & vb;              // and
                                     10'd60:  wa_val = vs & ~vb;             // andc
@@ -454,7 +526,7 @@ module ppc_exec #(
                                 if (sn != 7'd0) begin
                                     if (!xo10[7]) begin                       // load
                                         ld = 1; ld_mrg = 1; ld_pos = sk[1:0];
-                                        wa_idx = {1'b0, f_rt + sk[6:2]};
+                                        wa_idx = {2'b0, f_rt + sk[6:2]};
                                         wa_val = (sk[1:0] == 2'd0) ? 32'd0 : v_ms;
                                     end else begin                            // store
                                         st = 1;
@@ -474,8 +546,19 @@ module ppc_exec #(
                             10'd512: begin cr_n[31 - 4*f_crfd -: 4] = xer[31:28];            // mcrxr
                                            xer_n[31:28] = 4'd0; end
                             10'd4:   trapc = trap_cond(va, vb, f_rt);                         // tw
-                            10'd535, 10'd567, 10'd599, 10'd631, 10'd663, 10'd695, 10'd727,
-                            10'd759, 10'd983: fpu = 1;                                        // lfsx..stfiwx
+                            10'd535, 10'd567, 10'd663, 10'd695: fpu = 1;                      // lfsx, stfsx (not yet)
+                            10'd599, 10'd631, 10'd727, 10'd759: begin                         // lfdx(u), stfdx(u)
+                                fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2;
+                                ea = va0 + vb + {29'd0, sk[0], 2'b00};
+                                if (!xo10[7]) begin ld = 1; wa_idx = {1'b1, f_rt, sk[0]}; end
+                                else begin st = 1; st_data = v_ms; end
+                                if (!sk[0]) begin next_pc = pc; retire = 1'b0; ms_active_n = 1'b1; ms_reg_n = 7'd1; end
+                                else if (xo10[5]) begin wb_en = 1; wb_val = va0 + vb; end
+                            end
+                            10'd983: begin                                                    // stfiwx
+                                fpu = 1; fp_impl = 1; nonplain = 1; msize = 2'd2;
+                                st = 1; st_data = v_ms;
+                            end
                             10'd83:  if (pr) priv = 1;                                        // mfmsr
                                      else begin wa_en = 1; wa_val = msr; end
                             10'd146: if (pr) priv = 1;                                        // mtmsr
@@ -545,7 +628,7 @@ module ppc_exec #(
             if (ld) begin
                 ld_acc = 1'b1;
                 wa_val = (ck == 2'd0) ? 32'd0 : v_ms;
-                if (!c_last) begin wa_idx = 6'd32; fsize = 2'd2; ld_sext = 1'b0; ld_brev = 1'b0; end
+                if (!c_last) begin wa_idx = 7'd32; fsize = 2'd2; ld_sext = 1'b0; ld_brev = 1'b0; end
             end else begin
                 st_data = (st_data >> ({3'd0, c_nb[1:0] - 2'd1 - ck} << 3)) & 32'h0000_00FF;
             end
@@ -580,7 +663,7 @@ module ppc_exec #(
             exc = 1'b1; exc_vec = 20'h00400; srr1_n = srr1_n | isi_bits;   // instruction storage
         end else if (fpu && !msr[13]) begin
             exc = 1'b1; exc_vec = 20'h00800;                         // FP unavailable
-        end else if (illegal || fpu) begin
+        end else if (illegal || (fpu && !fp_impl)) begin
             exc = 1'b1; exc_vec = 20'h00700; srr1_n[19] = 1'b1;      // program: illegal instruction
         end else if (priv) begin
             exc = 1'b1; exc_vec = 20'h00700; srr1_n[18] = 1'b1;      // program: privileged
@@ -593,7 +676,7 @@ module ppc_exec #(
             wa_en = 1'b0; wb_en = 1'b0; ld = 1'b0; st = 1'b0;
             cr_n = cr; xer_n = xer; lr_n = lr; ctr_n = ctr; spr_we = 1'b0;
             ms_active_n = 1'b0; ms_reg_n = 7'd0; retire = 1'b1;
-            resv_set = 1'b0; resv_clr = 1'b0;
+            resv_set = 1'b0; resv_clr = 1'b0; fpscr_n = fpscr;
             ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0;
             srr_we = 1'b1;
             msr_n = msr & 32'h0000_1040;                             // keep ME and IP only
