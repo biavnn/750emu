@@ -18,7 +18,7 @@ CFLAGS_BARE   := $(CFLAGS_COMMON) -ffreestanding -fno-builtin -msdata=none -G 0
 LDFLAGS_BARE  := -Wl,--build-id=none -nostdlib -nostartfiles -static -no-pie -T sw/common/link.ld
 CFLAGS_LINUX  := $(CFLAGS_COMMON) -static -no-pie
 
-RTL := rtl/ppc_pkg.sv rtl/ppc_exec.sv rtl/ppc_core.sv rtl/ppc_pipe.sv rtl/soc_top.sv
+RTL := rtl/ppc_pkg.sv rtl/ppc_exec.sv rtl/ppc_mmu.sv rtl/ppc_core.sv rtl/ppc_pipe.sv rtl/soc_top.sv
 
 .PHONY: all sim tests test run clean randtest
 .SECONDARY:

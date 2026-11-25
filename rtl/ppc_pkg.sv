@@ -13,4 +13,15 @@ package ppc_pkg;
         else           ld_format = d;
     endfunction
 
+    // Exception entry helpers (shared so every exception path agrees)
+    function automatic logic [31:0] exc_msr(input logic [31:0] msr);
+        exc_msr = msr & 32'h0000_1040;                 // keep ME and IP only
+    endfunction
+    function automatic logic [31:0] exc_srr1(input logic [31:0] msr);
+        exc_srr1 = msr & 32'h87C0_FFFF;
+    endfunction
+    function automatic logic [31:0] exc_vector(input logic [31:0] msr, input logic [19:0] vec);
+        exc_vector = {msr[6] ? 12'hFFF : 12'h000, vec};
+    endfunction
+
 endpackage

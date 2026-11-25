@@ -8,7 +8,10 @@
 // Time base and decrementer advance once per executed step (not per clock),
 // so both cores see identical timer values and can be compared in lockstep.
 //
-// Not yet implemented: FPU (raises FP-unavailable / program exceptions), MMU,
+// Address translation: both lookups are combinational. On a TLB miss the core
+// stops, lets the MMU's walker use the data port, then retries the same step.
+//
+// Not yet implemented: FPU (raises FP-unavailable / program exceptions),
 // string ops, lwarx/stwcx., dcbz (program exception).
 
 module ppc_core #(
@@ -18,9 +21,9 @@ module ppc_core #(
     input  logic        clk,
     input  logic        rst,
     input  logic        irq,          // external interrupt (level)
-    output logic [31:0] imem_addr,
+    output logic [31:0] imem_addr,    // physical
     input  logic [31:0] imem_rdata,
-    output logic [31:0] dmem_addr,
+    output logic [31:0] dmem_addr,    // physical
     output logic [1:0]  dmem_size,    // 0=byte 1=half 2=word
     output logic        dmem_re,
     output logic        dmem_we,
@@ -46,18 +49,53 @@ module ppc_core #(
     logic        ms_active;
     logic [4:0]  ms_reg;
     logic        dec_pend;
+    logic        nf_i, nf_d;          // the walker found no PTE for this step's fetch / data access
 
-    wire [31:0] insn = imem_rdata;
-    assign imem_addr = pc;
+    // ------------------------------------------------------------------
+    // MMU
+    // ------------------------------------------------------------------
+    logic [31:0] i_pa, i_fbits, d_pa, d_fbits, wk_addr, wk_wdata, xspr_rdata, sr_rdata;
+    logic        i_ok, i_miss, i_flt, d_ok, d_miss, d_flt;
+    logic        wk_start, wk_busy, wk_done, wk_nf, wk_re, wk_we, xspr_valid;
 
     // execute outputs
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
     logic [31:0] msr_n, srr0_n, srr1_n;
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
+    logic        take_int, ctx_sync, sr_we, tlbie;
     logic        ld, st, ld_sext, ld_brev;
     logic [4:0]  wa_idx, ms_reg_n, ms_cur;
     logic [9:0]  spr_idx;
+    logic [3:0]  sr_idx;
     logic [1:0]  msize;
+
+    wire [31:0] insn = i_ok ? imem_rdata : 32'd0;
+    assign imem_addr = i_pa;
+
+    wire i_fault = i_flt | (i_miss & nf_i);
+    wire i_walk  = i_miss & ~nf_i & ~take_int;
+    wire mem     = ld | st;
+    wire d_fault = mem & (d_flt | (d_miss & nf_d));
+    wire d_walk  = mem & d_miss & ~nf_d;
+    wire walk    = i_walk | d_walk;
+    wire step    = ~rst & ~walk & ~wk_busy;       // one architectural step completes this cycle
+    wire dsi     = step & d_fault;
+    wire commit  = step & ~d_fault;
+    assign wk_start = ~rst & walk & ~wk_busy;
+
+    ppc_mmu u_mmu (
+        .clk, .rst, .msr,
+        .i_ea(pc), .i_pa, .i_ok, .i_miss, .i_flt, .i_fbits,
+        .d_ea(ea), .d_store(st), .d_pa, .d_ok, .d_miss, .d_flt, .d_fbits,
+        .wk_start, .wk_instr(i_walk), .wk_store(st), .wk_ea(i_walk ? pc : ea),
+        .wk_busy, .wk_done, .wk_nf, .wk_re, .wk_we, .wk_addr, .wk_wdata, .wk_rdata(dmem_rdata),
+        .spr_idx, .spr_rdata(xspr_rdata), .spr_rvalid(xspr_valid),
+        .spr_we(spr_we & commit), .spr_wdata(spr_val),
+        .sr_idx, .sr_rdata, .sr_we(sr_we & commit), .sr_wdata(gpr[insn[25:21]]),
+        .tlbie(tlbie & commit), .tlbie_ea(gpr[insn[15:11]]),
+        .dsi_we(dsi), .dsisr_in(d_fbits_x | (st ? 32'h0200_0000 : 32'h0)), .dar_in(ea)
+    );
+    wire [31:0] d_fbits_x = d_flt ? d_fbits : 32'h4000_0000;
 
     ppc_exec #(.PVR(PVR)) u_exec (
         .insn, .pc,
@@ -66,6 +104,9 @@ module ppc_core #(
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
+        .isi(i_fault), .isi_bits(i_flt ? i_fbits : 32'h4000_0000),
+        .xspr_valid, .xspr_rdata, .sr_rdata,
+        .take_int, .ctx_sync, .sr_we, .sr_idx, .tlbie,
         .msr_n, .srr_we, .srr0_n, .srr1_n, .exc, .int_ack_dec,
         .next_pc, .wa_en, .wa_idx, .wa_val, .wb_en, .wb_val,
         .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val,
@@ -76,24 +117,26 @@ module ppc_core #(
     wire [31:0] ld_val = ppc_pkg::ld_format(dmem_rdata, msize, ld_sext, ld_brev);
     wire        rf_we  = wa_en | ld;
     wire [31:0] rf_val = ld ? ld_val : wa_val;
-    wire        commit = ~rst;
-    wire [31:0] dec_n  = (spr_we && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
+    wire [31:0] dec_n  = (spr_we && commit && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
 
-    assign dmem_addr  = ea;
-    assign dmem_size  = msize;
-    assign dmem_re    = ld & commit;
-    assign dmem_we    = st & commit;
-    assign dmem_wdata = st_data;
+    // the walker borrows the data port while it runs
+    assign dmem_addr  = wk_busy ? wk_addr  : d_pa;
+    assign dmem_size  = wk_busy ? 2'd2     : msize;
+    assign dmem_re    = wk_busy ? wk_re    : ld & commit;
+    assign dmem_we    = wk_busy ? wk_we    : st & commit;
+    assign dmem_wdata = wk_busy ? wk_wdata : st_data;
 
     // trace
-    assign tr_valid   = commit;
+    assign tr_valid   = step;
     assign tr_pc      = pc;
     assign tr_insn    = insn;
-    assign tr_rf_we   = rf_we;  assign tr_rf_idx = wa_idx;      assign tr_rf_val = rf_val;
-    assign tr_up_we   = wb_en;  assign tr_up_idx = insn[20:16]; assign tr_up_val = wb_val;
-    assign tr_cr = cr_n; assign tr_xer = xer_n; assign tr_lr = lr_n; assign tr_ctr = ctr_n;
-    assign tr_msr = msr_n; assign tr_exc = exc;
-    assign tr_st = st; assign tr_st_addr = ea; assign tr_st_data = st_data; assign tr_st_size = msize;
+    assign tr_rf_we   = rf_we & ~dsi;  assign tr_rf_idx = wa_idx;      assign tr_rf_val = rf_val;
+    assign tr_up_we   = wb_en & ~dsi;  assign tr_up_idx = insn[20:16]; assign tr_up_val = wb_val;
+    assign tr_cr  = dsi ? cr  : cr_n;  assign tr_xer = dsi ? xer : xer_n;
+    assign tr_lr  = dsi ? lr  : lr_n;  assign tr_ctr = dsi ? ctr : ctr_n;
+    assign tr_msr = dsi ? ppc_pkg::exc_msr(msr) : msr_n;
+    assign tr_exc = exc | dsi;
+    assign tr_st = st & ~dsi; assign tr_st_addr = ea; assign tr_st_data = st_data; assign tr_st_size = msize;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -104,31 +147,46 @@ module ppc_core #(
             for (int i = 0; i < 32; i++) gpr[i] <= 0;
             tb <= 0; dec_pend <= 0;
             ms_active <= 0; ms_reg <= 0;
+            nf_i <= 0; nf_d <= 0;
             instret <= 0; cycles <= 0;
         end else begin
             cycles <= cycles + 64'd1;
-            tb <= tb + 64'd1;
-            dec_r <= dec_n;
-            if (int_ack_dec) dec_pend <= 0;
-            if (!dec_r[31] && dec_n[31]) dec_pend <= 1;     // decrementer passed zero
-
-            pc  <= next_pc;
-            cr  <= cr_n;  xer <= xer_n;  lr <= lr_n;  ctr <= ctr_n;  msr <= msr_n;
-            if (wb_en) gpr[insn[20:16]] <= wb_val;
-            if (rf_we) gpr[wa_idx] <= rf_val;   // load result wins over update (invalid form)
-            if (spr_we) case (spr_idx)
-                10'd26:  srr0 <= spr_val;
-                10'd27:  srr1 <= spr_val;
-                10'd272, 10'd273, 10'd274, 10'd275: sprg[spr_idx[1:0]] <= spr_val;
-                10'd284: tb[31:0]  <= spr_val;
-                10'd285: tb[63:32] <= spr_val;
-                10'd1008: hid0 <= spr_val;
-                10'd1009: hid1 <= spr_val;
-                default: ;
-            endcase
-            if (srr_we) begin srr0 <= srr0_n; srr1 <= srr1_n; end
-            ms_active <= ms_active_n; ms_reg <= ms_reg_n;
-            if (retire && !exc) instret <= instret + 64'd1;
+            if (wk_done && wk_nf) begin
+                if (i_walk) nf_i <= 1; else nf_d <= 1;
+            end
+            if (step) begin
+                nf_i <= 0; nf_d <= 0;
+                tb <= tb + 64'd1;
+                dec_r <= dec_n;
+                if (int_ack_dec) dec_pend <= 0;
+                if (!dec_r[31] && dec_n[31]) dec_pend <= 1;     // decrementer passed zero
+            end
+            if (dsi) begin
+                // data storage interrupt: nothing from this instruction commits
+                pc   <= ppc_pkg::exc_vector(msr, 20'h00300);
+                srr0 <= pc;
+                srr1 <= ppc_pkg::exc_srr1(msr);
+                msr  <= ppc_pkg::exc_msr(msr);
+                ms_active <= 0; ms_reg <= 0;
+            end else if (commit) begin
+                pc  <= next_pc;
+                cr  <= cr_n;  xer <= xer_n;  lr <= lr_n;  ctr <= ctr_n;  msr <= msr_n;
+                if (wb_en) gpr[insn[20:16]] <= wb_val;
+                if (rf_we) gpr[wa_idx] <= rf_val;   // load result wins over update (invalid form)
+                if (spr_we) case (spr_idx)
+                    10'd26:  srr0 <= spr_val;
+                    10'd27:  srr1 <= spr_val;
+                    10'd272, 10'd273, 10'd274, 10'd275: sprg[spr_idx[1:0]] <= spr_val;
+                    10'd284: tb[31:0]  <= spr_val;
+                    10'd285: tb[63:32] <= spr_val;
+                    10'd1008: hid0 <= spr_val;
+                    10'd1009: hid1 <= spr_val;
+                    default: ;
+                endcase
+                if (srr_we) begin srr0 <= srr0_n; srr1 <= srr1_n; end
+                ms_active <= ms_active_n; ms_reg <= ms_reg_n;
+                if (retire && !exc) instret <= instret + 64'd1;
+            end
         end
     end
 endmodule

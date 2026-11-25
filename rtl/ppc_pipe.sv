@@ -19,6 +19,13 @@
 //   When data-access faults arrive with the MMU, MEM-stage faults will need
 //   these writes to move later or be undone.
 // - Time base and decrementer advance once per EX step, matching ppc_core.
+// - MMU: fetch translates in IF. A fetch that misses the TLB or faults is not
+//   acted on speculatively; it travels down the pipe as a marker and is
+//   resolved when it reaches EX (page walk then refetch, or ISI). Data
+//   addresses are translated in EX, so DSI is an EX-stage exception as well.
+//   The walker borrows the data port while EX is stalled. Instructions
+//   that change the translation context (mtmsr, mtsr, BAT/SDR1 writes, tlbie)
+//   flush everything fetched after them.
 // - Correctly predicted taken branches cost 1 cycle (the wrong-path fetch);
 //   mispredictions are fixed in EX and flush IF/ID and ID/EX (2 cycles).
 // - lmw/stmw stay in EX for one micro-op per register; the front end holds.
@@ -68,7 +75,10 @@ module ppc_pipe #(
     logic [31:0] pc_f;
 
     logic        d_valid;  logic [31:0] d_pc, d_insn;            // IF/ID
+    logic        d_imiss, d_iflt; logic [31:0] d_ifbits;          //   fetch marker
     logic        e_valid;  logic [31:0] e_pc, e_insn;            // ID/EX
+    logic        e_imiss, e_iflt; logic [31:0] e_ifbits;
+    logic        e_nf_i, e_nf_d;                                  // walker found no PTE
     logic [31:0] e_pred_pc;                                       // predicted next PC
     logic        e_ms_active; logic [4:0] e_ms_reg;               // lmw/stmw sequencer
 
@@ -77,7 +87,7 @@ module ppc_pipe #(
         logic [31:0] pc, insn;
         logic        rf_we, ld;  logic [4:0] rf_idx; logic [31:0] rf_val;
         logic        up_we;      logic [4:0] up_idx; logic [31:0] up_val;
-        logic        st;         logic [31:0] ea, st_data;
+        logic        st;         logic [31:0] ea, pa, st_data;
         logic [1:0]  size;       logic sext, brev;
         logic        retire;
         logic [31:0] cr, xer, lr, ctr, msr;   // trace snapshot after this step
@@ -91,7 +101,11 @@ module ppc_pipe #(
     // ------------------------------------------------------------------
     // IF
     // ------------------------------------------------------------------
-    assign imem_addr = pc_f;
+    logic [31:0] i_pa, i_fbits, d_pa, d_fbits, wk_addr, wk_wdata, xspr_rdata, sr_rdata;
+    logic        i_ok, i_miss, i_flt, d_ok, d_miss, d_flt;
+    logic        wk_start, wk_busy, wk_done, wk_nf, wk_re, wk_we, xspr_valid;
+
+    assign imem_addr = i_pa;
 
     // ------------------------------------------------------------------
     // ID: static branch prediction
@@ -178,6 +192,8 @@ module ppc_pipe #(
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
     logic [31:0] msr_n, srr0_n, srr1_n;
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
+    logic        take_int, ctx_sync, sr_we, tlbie;
+    logic [3:0]  sr_idx;
     logic        ld, st, ld_sext, ld_brev;
     logic [4:0]  wa_idx, ms_reg_n, ms_cur_unused;
     logic [9:0]  spr_idx;
@@ -190,6 +206,9 @@ module ppc_pipe #(
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
+        .isi(e_iflt | (e_imiss & e_nf_i)), .isi_bits(e_iflt ? e_ifbits : 32'h4000_0000),
+        .xspr_valid, .xspr_rdata, .sr_rdata,
+        .take_int, .ctx_sync, .sr_we, .sr_idx, .tlbie,
         .msr_n, .srr_we, .srr0_n, .srr1_n, .exc, .int_ack_dec,
         .next_pc, .wa_en, .wa_idx, .wa_val, .wb_en, .wb_val,
         .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val,
@@ -197,21 +216,48 @@ module ppc_pipe #(
         .ld, .st, .ld_sext, .ld_brev, .msize, .ea, .st_data
     );
 
-    wire ex_go     = e_valid && !ld_use;      // one architectural step happens this cycle
-    wire ex_commit = ex_go;
-    wire [31:0] dec_n = (spr_we && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
+    wire e_iwalk   = e_imiss & ~e_nf_i & ~take_int;
+    wire mem       = ld | st;
+    wire e_dflt    = mem & (d_flt | (d_miss & e_nf_d));
+    wire e_dwalk   = mem & d_miss & ~e_nf_d;
+    wire base_go   = e_valid && !ld_use;
+    wire need_walk = base_go && (e_iwalk | e_dwalk);
+    // The walker becomes busy the cycle after wk_start; EX is stalled by then, so
+    // MEM holds a bubble and the data port is free.
+    assign wk_start = need_walk && !wk_busy;
+    wire ex_go     = base_go && !need_walk;   // one architectural step happens this cycle
+    wire dsi       = ex_go && e_dflt;
+    wire ex_commit = ex_go && !e_dflt;
+    wire [31:0] dec_n = (spr_we && ex_commit && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
     wire ms_cont   = ex_commit && ms_active_n;                    // lmw/stmw has more steps
-    wire redirect  = ex_commit && retire && (next_pc != e_pred_pc);
-    wire hold      = ld_use || ms_cont;
+    wire redirect  = ex_go && (dsi || exc || ctx_sync || (retire && next_pc != e_pred_pc));
+    wire [31:0] redirect_pc = dsi ? ppc_pkg::exc_vector(msr, 20'h00300) : next_pc;
+    wire irefetch  = wk_done && !wk_nf && e_iwalk;                // page now in the ITLB: fetch again
+    wire hold      = ld_use || ms_cont || need_walk;
+
+    wire [31:0] d_fbits_x = d_flt ? d_fbits : 32'h4000_0000;
+
+    ppc_mmu u_mmu (
+        .clk, .rst, .msr,
+        .i_ea(pc_f), .i_pa, .i_ok, .i_miss, .i_flt, .i_fbits,
+        .d_ea(ea), .d_store(st), .d_pa, .d_ok, .d_miss, .d_flt, .d_fbits,
+        .wk_start, .wk_instr(e_iwalk), .wk_store(st), .wk_ea(e_iwalk ? e_pc : ea),
+        .wk_busy, .wk_done, .wk_nf, .wk_re, .wk_we, .wk_addr, .wk_wdata, .wk_rdata(dmem_rdata),
+        .spr_idx, .spr_rdata(xspr_rdata), .spr_rvalid(xspr_valid),
+        .spr_we(spr_we & ex_commit), .spr_wdata(spr_val),
+        .sr_idx, .sr_rdata, .sr_we(sr_we & ex_commit), .sr_wdata(e_vs),
+        .tlbie(tlbie & ex_commit), .tlbie_ea(e_vb),
+        .dsi_we(dsi), .dsisr_in(d_fbits_x | (st ? 32'h0200_0000 : 32'h0)), .dar_in(ea)
+    );
 
     // ------------------------------------------------------------------
     // MEM
     // ------------------------------------------------------------------
-    assign dmem_addr  = m.ea;
-    assign dmem_size  = m.size;
-    assign dmem_re    = m.valid && m.ld;
-    assign dmem_we    = m.valid && m.st;
-    assign dmem_wdata = m.st_data;
+    assign dmem_addr  = wk_busy ? wk_addr  : m.pa;
+    assign dmem_size  = wk_busy ? 2'd2     : m.size;
+    assign dmem_re    = wk_busy ? wk_re    : m.valid && m.ld;
+    assign dmem_we    = wk_busy ? wk_we    : m.valid && m.st;
+    assign dmem_wdata = wk_busy ? wk_wdata : m.st_data;
 
     wire [31:0] m_ld_val = ppc_pkg::ld_format(dmem_rdata, m.size, m.sext, m.brev);
 
@@ -232,8 +278,9 @@ module ppc_pipe #(
     always_ff @(posedge clk) begin
         if (rst) begin
             pc_f <= RESET_PC;
-            d_valid <= 0; d_pc <= 0; d_insn <= 0;
+            d_valid <= 0; d_pc <= 0; d_insn <= 0; d_imiss <= 0; d_iflt <= 0; d_ifbits <= 0;
             e_valid <= 0; e_pc <= 0; e_insn <= 0; e_pred_pc <= 0;
+            e_imiss <= 0; e_iflt <= 0; e_ifbits <= 0; e_nf_i <= 0; e_nf_d <= 0;
             e_ms_active <= 0; e_ms_reg <= 0;
             m <= '0; w <= '0;
             cr <= 0; xer <= 0; lr <= 0; ctr <= 0; msr <= 0;
@@ -259,22 +306,35 @@ module ppc_pipe #(
             if (m.ld) w.rf_val <= m_ld_val;
 
             // ---- EX -> MEM ----
-            m.valid   <= ex_commit;
+            m.valid   <= ex_go;
             m.pc      <= e_pc;       m.insn   <= e_insn;
-            m.rf_we   <= wa_en | ld; m.ld     <= ld;
+            m.rf_we   <= (wa_en | ld) & ~dsi;   m.ld <= ld & ~dsi;
             m.rf_idx  <= wa_idx;     m.rf_val <= wa_val;
-            m.up_we   <= wb_en;      m.up_idx <= e_ra;    m.up_val <= wb_val;
-            m.st      <= st;         m.ea     <= ea;      m.st_data <= st_data;
+            m.up_we   <= wb_en & ~dsi;  m.up_idx <= e_ra;    m.up_val <= wb_val;
+            m.st      <= st & ~dsi;  m.ea     <= ea;      m.pa <= d_pa;  m.st_data <= st_data;
             m.size    <= msize;      m.sext   <= ld_sext; m.brev    <= ld_brev;
             m.retire  <= retire;
-            m.cr <= cr_n; m.xer <= xer_n; m.lr <= lr_n; m.ctr <= ctr_n; m.msr <= msr_n;
-            m.exc <= exc;
+            m.cr  <= dsi ? cr  : cr_n;   m.xer <= dsi ? xer : xer_n;
+            m.lr  <= dsi ? lr  : lr_n;   m.ctr <= dsi ? ctr : ctr_n;
+            m.msr <= dsi ? ppc_pkg::exc_msr(msr) : msr_n;
+            m.exc <= exc | dsi;
 
-            if (ex_commit) begin
+            if (wk_done && wk_nf) begin
+                if (e_iwalk) e_nf_i <= 1; else e_nf_d <= 1;
+            end
+            if (ex_go) begin
+                e_nf_i <= 0; e_nf_d <= 0;
                 tb <= tb + 64'd1;
                 dec_r <= dec_n;
                 if (int_ack_dec) dec_pend <= 0;
                 if (!dec_r[31] && dec_n[31]) dec_pend <= 1;
+            end
+            if (dsi) begin
+                srr0 <= e_pc;
+                srr1 <= ppc_pkg::exc_srr1(msr);
+                msr  <= ppc_pkg::exc_msr(msr);
+                e_ms_active <= 0; e_ms_reg <= 0;
+            end else if (ex_commit) begin
                 cr <= cr_n; xer <= xer_n; lr <= lr_n; ctr <= ctr_n; msr <= msr_n;
                 if (spr_we) case (spr_idx)
                     10'd26:  srr0 <= spr_val;
@@ -292,17 +352,20 @@ module ppc_pipe #(
             end
 
             // ---- front end ----
-            if (redirect) begin
-                pc_f <= next_pc;
+            if (redirect || irefetch) begin
+                pc_f <= redirect ? redirect_pc : e_pc;
                 d_valid <= 0; e_valid <= 0;
             end else if (!hold) begin
                 e_valid <= d_valid; e_pc <= d_pc; e_insn <= d_insn;
+                e_imiss <= d_imiss; e_iflt <= d_iflt; e_ifbits <= d_ifbits;
                 e_pred_pc <= id_taken ? id_target : d_pc + 32'd4;
                 if (id_taken) begin
                     pc_f <= id_target;                // drop the sequential fetch
                     d_valid <= 0;
                 end else begin
-                    d_valid <= 1; d_pc <= pc_f; d_insn <= imem_rdata;
+                    // a fetch that cannot be translated yet becomes a marker
+                    d_valid <= 1; d_pc <= pc_f; d_insn <= i_ok ? imem_rdata : 32'd0;
+                    d_imiss <= i_miss; d_iflt <= i_flt; d_ifbits <= i_fbits;
                     pc_f <= pc_f + 32'd4;
                 end
             end

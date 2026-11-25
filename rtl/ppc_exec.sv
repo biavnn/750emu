@@ -35,6 +35,16 @@ module ppc_exec #(
     output logic [31:0] spr_val,
     input  logic        int_ext,    // external interrupt request (level)
     input  logic        int_dec,    // decrementer interrupt pending
+    input  logic        isi,        // instruction fetch faulted (insn is not valid)
+    input  logic [31:0] isi_bits,   // SRR1 reason bits for the ISI
+    input  logic        xspr_valid, // f_spr names a register held outside (MMU)
+    input  logic [31:0] xspr_rdata,
+    input  logic [31:0] sr_rdata,   // SR[sr_idx]
+    output logic        take_int,   // this step takes an asynchronous interrupt
+    output logic        ctx_sync,   // translation context changed: refetch what follows
+    output logic        sr_we,      // SR[sr_idx] <- vs
+    output logic [3:0]  sr_idx,
+    output logic        tlbie,      // invalidate TLB entries for EA = vb
     output logic [31:0] msr_n,      // MSR after this step
     output logic        srr_we,     // exception entry: write SRR0/SRR1
     output logic [31:0] srr0_n, srr1_n,
@@ -56,7 +66,7 @@ module ppc_exec #(
     localparam logic [31:0] MSR_MASK = 32'h0000_FF72;
 
     logic        upd;
-    logic        msr_we, illegal, priv, trapc, fpu, sc_c, rfi_c, take_int;
+    logic        msr_we, illegal, priv, trapc, fpu, sc_c, rfi_c;
     logic [19:0] exc_vec;
     wire         pr = msr[14];
     logic        rec_en; logic [31:0] rec_val;   // Rc=1 -> CR0
@@ -83,6 +93,11 @@ module ppc_exec #(
     wire [7:0]  f_crm = insn[19:12];
 
     wire [31:0] va0 = (f_ra == 5'd0) ? 32'd0 : va;
+    // register selectors are kept out of the main decode block: the values they
+    // select (sr_rdata, xspr_rdata) feed back into it
+    assign spr_idx = f_spr;
+    assign sr_idx  = (opcd == 6'd31 && (xo10 == 10'd242 || xo10 == 10'd659)) ? vb[31:28] : insn[19:16];
+
     wire xer_so = xer[31];
     wire xer_ca = xer[29];
 
@@ -205,9 +220,10 @@ module ppc_exec #(
         cr_n = cr; xer_n = xer; lr_n = lr; ctr_n = ctr;
         rec_en = 1'b0; rec_val = 32'd0;
         oe_en = 1'b0; oe_ov = 1'b0;
-        spr_we = 1'b0; spr_idx = f_spr; spr_val = vs;
+        spr_we = 1'b0; spr_val = vs;
         msr_we = 1'b0;
         illegal = 1'b0; priv = 1'b0; trapc = 1'b0; fpu = 1'b0; sc_c = 1'b0; rfi_c = 1'b0;
+        ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0;
         retire = 1'b1;
         ms_active_n = 1'b0; ms_reg_n = 5'd0;
         ld = 1'b0; st = 1'b0; ld_sext = 1'b0; ld_brev = 1'b0; upd = 1'b0;
@@ -396,7 +412,17 @@ module ppc_exec #(
                             10'd759, 10'd983: fpu = 1;                                        // lfsx..stfiwx
                             10'd83:  if (pr) priv = 1;                                        // mfmsr
                                      else begin wa_en = 1; wa_val = msr; end
-                            10'd146: if (pr) priv = 1; else msr_we = 1;                       // mtmsr
+                            10'd146: if (pr) priv = 1;                                        // mtmsr
+                                     else begin msr_we = 1; ctx_sync = 1; end
+                            10'd210, 10'd242: if (pr) priv = 1; else begin                    // mtsr, mtsrin
+                                sr_we = 1; ctx_sync = 1;
+                            end
+                            10'd595, 10'd659: if (pr) priv = 1; else begin                    // mfsr, mfsrin
+                                wa_en = 1; wa_val = sr_rdata;
+                            end
+                            10'd306: if (pr) priv = 1;                                        // tlbie
+                                     else begin tlbie = 1; ctx_sync = 1; end
+                            10'd566: if (pr) priv = 1;                                        // tlbsync
                             10'd339, 10'd371: if (pr && f_spr[4]) priv = 1; else begin        // mfspr, mftb
                                 wa_en = 1;
                                 case (f_spr)
@@ -412,7 +438,7 @@ module ppc_exec #(
                                     10'd287: wa_val = PVR;
                                     10'd1008: wa_val = hid0;
                                     10'd1009: wa_val = hid1;
-                                    default: illegal = 1;
+                                    default: if (xspr_valid) wa_val = xspr_rdata; else illegal = 1;
                                 endcase
                             end
                             10'd467: if (pr && f_spr[4]) priv = 1; else begin                 // mtspr
@@ -422,7 +448,8 @@ module ppc_exec #(
                                     10'd9:   ctr_n = vs;
                                     10'd22, 10'd26, 10'd27, 10'd272, 10'd273, 10'd274, 10'd275,
                                     10'd284, 10'd285, 10'd1008, 10'd1009: spr_we = 1;
-                                    default: illegal = 1;
+                                    default: if (xspr_valid) begin spr_we = 1; ctx_sync = 1; end
+                                             else illegal = 1;
                                 endcase
                             end
 
@@ -457,6 +484,8 @@ module ppc_exec #(
         take_int = (int_ext | int_dec) & msr[15] & ~ms_active;
         if (take_int) begin
             exc = 1'b1; exc_vec = int_ext ? 20'h00500 : 20'h00900; int_ack_dec = ~int_ext;
+        end else if (isi) begin
+            exc = 1'b1; exc_vec = 20'h00400; srr1_n = srr1_n | isi_bits;   // instruction storage
         end else if (fpu && !msr[13]) begin
             exc = 1'b1; exc_vec = 20'h00800;                         // FP unavailable
         end else if (illegal || fpu) begin
@@ -472,6 +501,7 @@ module ppc_exec #(
             wa_en = 1'b0; wb_en = 1'b0; ld = 1'b0; st = 1'b0;
             cr_n = cr; xer_n = xer; lr_n = lr; ctr_n = ctr; spr_we = 1'b0;
             ms_active_n = 1'b0; ms_reg_n = 5'd0; retire = 1'b1;
+            ctx_sync = 1'b0; sr_we = 1'b0; tlbie = 1'b0;
             srr_we = 1'b1;
             msr_n = msr & 32'h0000_1040;                             // keep ME and IP only
             next_pc = {msr[6] ? 12'hFFF : 12'h000, exc_vec};
