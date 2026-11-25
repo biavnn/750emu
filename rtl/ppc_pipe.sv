@@ -223,7 +223,7 @@ module ppc_pipe #(
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
     logic [31:0] msr_n, srr0_n, srr1_n;
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
-    logic        take_int, ctx_sync, sr_we, tlbie;
+    logic        take_int, ctx_sync, sr_we, tlbie, mc_busy;
     logic [3:0]  sr_idx;
     logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, resv_set, resv_clr;
     logic [6:0]  wa_idx;
@@ -233,6 +233,7 @@ module ppc_pipe #(
     logic [1:0]  msize;
 
     ppc_exec #(.PVR(PVR)) u_exec (
+        .clk, .rst, .ex_en(base_go), .step(ex_go), .busy(mc_busy),
         .insn(e_insn), .pc(e_pc),
         .va(e_va), .vb(e_vb), .vs(e_vs), .v_ms(e_vm),
         .ms_active(e_ms_active), .ms_reg(e_ms_reg), .resv, .resv_addr, .fpscr, .fpscr_n,
@@ -266,7 +267,7 @@ module ppc_pipe #(
 
     // The walker may only start once MEM is empty, so the data bus is idle.
     assign wk_start = need_walk && !wk_busy && !m.valid;
-    wire ex_try    = base_go && !need_walk && !wk_busy && m_free;
+    wire ex_try    = base_go && !need_walk && !wk_busy && !mc_busy && m_free;
     wire ex_go     = ex_try && (!mem_need || dbus_gnt);   // one architectural step happens this cycle
     wire dsi       = ex_go && e_dflt;
     wire ex_commit = ex_go && !e_dflt;

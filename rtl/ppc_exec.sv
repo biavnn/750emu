@@ -1,7 +1,9 @@
 // Shared decode + execute logic for g3core.
 //
-// Purely combinational: given one instruction, its operand values and the
-// current special-register state, produce every architectural side effect.
+// Given one instruction, its operand values and the current special-register
+// state, produce every architectural side effect. Everything is combinational
+// except the two iterative units inside (FPU and integer divider): while one
+// of them is working, `busy` is high and the core must not complete the step.
 // Used unchanged by the single-cycle reference core (ppc_core) and the EX stage
 // of the pipelined core (ppc_pipe), so both implement identical semantics.
 //
@@ -11,6 +13,11 @@
 module ppc_exec #(
     parameter logic [31:0] PVR = 32'h0008_0301   // 750 v3.1
 ) (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        ex_en,     // insn and operands are valid this cycle
+    input  logic        step,      // the core completes a step this cycle
+    output logic        busy,      // an iterative unit needs more cycles
     input  logic [31:0] insn,
     input  logic [31:0] pc,
     input  logic [31:0] va,        // GPR[RA]
@@ -171,7 +178,10 @@ module ppc_exec #(
     logic        fpu_fr, fpu_fi, fpu_setf;
     logic [4:0]  fpu_fprf;
     logic [3:0]  fpu_cmp;
+    wire fpu_req = fp_go && ex_en;
+    logic fpu_done;
     ppc_fpu u_fpu (
+        .clk, .rst, .req(fpu_req), .clear(step), .done(fpu_done),
         .op(fp_go ? fop : 4'd0), .single(opcd == 6'd59 || fop == 4'd9), .rn(fpscr[1:0]), .ve(fpscr[7]),
         .a(!fp_go ? 64'd0 : fp_3op ? fp_a : {va, vs}),
         .b(!fp_go ? 64'd0 : {vb, v_ms}),
@@ -297,8 +307,16 @@ module ppc_exec #(
 
     wire        div_zero = (vb == 32'd0);
     wire        div_sovf = (va == 32'h8000_0000) && (vb == 32'hFFFF_FFFF);
-    wire [31:0] divw_r   = (div_zero || div_sovf) ? 32'd0 : 32'($signed(va) / $signed(vb));
-    wire [31:0] divwu_r  = div_zero ? 32'd0 : va / vb;
+    wire        is_div   = (opcd == 6'd31) && (xo9 == 9'd491 || xo9 == 9'd459);
+    wire        div_req  = is_div && ex_en && !div_zero && !(xo9 == 9'd491 && div_sovf);
+    logic       div_done;
+    logic [31:0] div_q;
+    ppc_div u_div (
+        .clk, .rst, .req(div_req), .clear(step), .done(div_done),
+        .is_signed(xo9 == 9'd491), .a(va), .b(vb), .q(div_q)
+    );
+    wire [31:0] divw_r   = (div_zero || div_sovf) ? 32'd0 : div_q;
+    wire [31:0] divwu_r  = div_zero ? 32'd0 : div_q;
 
     wire [5:0]  shn   = vb[5:0];
     wire [31:0] slw_r = shn[5] ? 32'd0 : (vs << shn[4:0]);
@@ -801,6 +819,7 @@ module ppc_exec #(
         end
     end
 
+    assign busy = (fpu_req && !fpu_done) || (div_req && !div_done);
     assign fpt_a = {va, vs};
     assign fpt_b = {vb, v_ms};
     assign fplo  = fpu_res[31:0];

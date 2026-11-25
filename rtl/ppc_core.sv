@@ -78,7 +78,7 @@ module ppc_core #(
     logic [31:0] next_pc, wa_val, wb_val, cr_n, xer_n, lr_n, ctr_n, spr_val, ea, st_data;
     logic [31:0] msr_n, srr0_n, srr1_n;
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
-    logic        take_int, ctx_sync, sr_we, tlbie;
+    logic        take_int, ctx_sync, sr_we, tlbie, mc_busy;
     logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, ms_ruse, resv_set, resv_clr;
     logic [6:0]  wa_idx, ms_ridx;
     logic [6:0]  ms_reg_n;
@@ -96,7 +96,7 @@ module ppc_core #(
     wire d_fault = mem & (d_flt | (d_miss & nf_d));
     wire d_walk  = mem & d_miss & ~nf_d;
     wire walk    = i_walk | d_walk;
-    wire step    = ~rst & ~walk & ~wk_busy;       // one architectural step completes this cycle
+    wire step    = ~rst & ~walk & ~wk_busy & ~mc_busy;   // one architectural step completes this cycle
     wire dsi     = step & d_fault;
     wire commit  = step & ~d_fault;
     assign wk_start = ~rst & walk & ~wk_busy;
@@ -117,6 +117,7 @@ module ppc_core #(
     wire [31:0] d_fbits_x = d_flt ? d_fbits : 32'h4000_0000;
 
     ppc_exec #(.PVR(PVR)) u_exec (
+        .clk, .rst, .ex_en(~rst & ~wk_busy), .step, .busy(mc_busy),
         .insn, .pc,
         .va(gpr[ra_idx]), .vb(gpr[rb_idx]), .vs(gpr[rs_idx]), .v_ms(gpr[ms_ridx]),
         .ms_active, .ms_reg, .resv, .resv_addr, .fpscr, .fpscr_n,

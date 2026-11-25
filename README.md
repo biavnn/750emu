@@ -62,14 +62,15 @@ request, no caches yet):
 
 | Test | CPI |
 |---|---|
-| arith | 1.19 |
+| arith | 1.38 |
 | isa | 1.31 |
 | hello | 1.35 |
 | sort | 1.40 |
 | Linux boot | 1.51 |
 
 The extra fetch stage costs one more cycle per taken or mispredicted branch
-than the earlier 5-stage version (Linux boot was 1.34).
+than the earlier 5-stage version (Linux boot was 1.34). `arith` is
+divide-heavy and pays for the iterative divider.
 
 Implemented ISA: integer arithmetic (all carrying, extended, overflow and record
 forms), multiply/divide, logical, shifts, rotates, `cntlzw`, `extsb`/`extsh`,
@@ -132,6 +133,8 @@ Floating point (`rtl/ppc_fpu.sv`, IEEE 754 with PowerPC semantics):
   and the record (`.`) forms that copy FPSCR bits to CR1
 - the 32 FPRs live in the same register file as the GPRs as 32-bit halves; an
   FP instruction takes 2 or 3 sequencer steps (operands, compute, second word)
+- integer `divw`/`divwu` use a separate iterative divider (`rtl/ppc_div.sv`,
+  17 cycles); the execute unit raises `busy` while either unit is working
 
 Checked with `make fprandtest`: random FP programs plus operands constructed to
 land on rounding ties, denormal and overflow boundaries, in all rounding modes,
@@ -151,9 +154,11 @@ FP limitations and known differences from QEMU 8.2:
   exception); compares leave FI and the class bit C alone (QEMU rewrites them).
 - The upper word of an `fctiw` result and FPRF after an invalid conversion are
   undefined by the architecture; g3core gives the same values as QEMU.
-- The FPU is one large combinational block (a 106-bit multiplier, a 224-bit
-  adder and a divider); it must become iterative before it can meet timing on
-  an FPGA, and it currently slows the Verilator model by about 3x.
+- The FPU is multi-cycle: a 53x17 multiplier used four times, a divider
+  producing two quotient bits per cycle, then one cycle each for alignment,
+  the 224-bit add, normalisation and rounding (roughly 5 cycles for an add, 9
+  for a multiply, 35 for a divide). Whether those stages meet timing on an
+  FPGA is unknown until synthesis; the wide adder and shifters are the risk.
 
 MMU (`rtl/ppc_mmu.sv`, shared by both cores):
 - 4 instruction + 4 data BATs, 16 segment registers (`mtsr`/`mfsr`/`mtsrin`/`mfsrin`), SDR1
@@ -189,7 +194,8 @@ Not yet implemented: machine check, trace/single-step, alignment exception.
 ```
 rtl/ppc_pkg.sv      shared helpers
 rtl/ppc_exec.sv     decode + execute (combinational, shared by both cores)
-rtl/ppc_fpu.sv      floating-point unit
+rtl/ppc_fpu.sv      floating-point unit (multi-cycle)
+rtl/ppc_div.sv      iterative integer divider
 rtl/ppc_mmu.sv      BATs, segments, TLBs, page table walker
 rtl/ppc_core.sv     single-cycle reference core
 rtl/ppc_pipe.sv     5-stage pipeline
@@ -269,9 +275,8 @@ test passes when both produce identical output and exit codes.
 
 ## Next steps
 
-1. Rest of phase 4: instruction and data caches behind the two buses, an
-   iterative FPU and integer divider (both are single-cycle combinational
-   blocks today), a real-time time base, separate GPR and FPR register files,
+1. Rest of phase 4: instruction and data caches behind the two buses, a
+   pipelined integer multiplier, a real-time time base, separate GPR and FPR register files,
    2-way TLBs; then synthesis and FPGA bring-up on an Artix-7 board with DDR3.
 2. Performance: a branch target buffer and prediction in F1/F2 to win back the
    extra fetch stage.
