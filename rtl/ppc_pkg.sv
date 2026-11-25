@@ -13,6 +13,18 @@ package ppc_pkg;
         else           ld_format = d;
     endfunction
 
+    // Final value of a load. Three cases:
+    //   mrg: string load, one byte OR-ed into position pos of the register being assembled
+    //   acc: page-crossing load done a byte at a time, shifting into an accumulator
+    //   otherwise an ordinary load
+    function automatic logic [31:0] ld_result(input logic [31:0] d, input logic [1:0] fsize,
+                                              input logic sext, input logic brev,
+                                              input logic mrg, input logic [1:0] pos,
+                                              input logic acc, input logic [31:0] base);
+        if (mrg) ld_result = base | ({24'd0, d[7:0]} << (5'd24 - {pos, 3'b000}));
+        else     ld_result = ld_format(acc ? {base[23:0], d[7:0]} : d, fsize, sext, brev);
+    endfunction
+
     // Exception entry helpers (shared so every exception path agrees)
     function automatic logic [31:0] exc_msr(input logic [31:0] msr);
         exc_msr = msr & 32'h0000_1040;                 // keep ME and IP only

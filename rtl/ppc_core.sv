@@ -42,13 +42,15 @@ module ppc_core #(
     output logic [1:0]  tr_st_size
 );
     logic [31:0] pc;
-    logic [31:0] gpr [32];
+    logic [31:0] gpr [33];          // [32] = hidden temporary for page-crossing loads
     logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1;
     logic [31:0] sprg [4];
     logic [63:0] tb;
     logic        ms_active;
-    logic [4:0]  ms_reg;
+    logic [6:0]  ms_reg;
     logic        dec_pend;
+    logic        resv;
+    logic [31:0] resv_addr;
     logic        nf_i, nf_d;          // the walker found no PTE for this step's fetch / data access
 
     // ------------------------------------------------------------------
@@ -63,8 +65,10 @@ module ppc_core #(
     logic [31:0] msr_n, srr0_n, srr1_n;
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
     logic        take_int, ctx_sync, sr_we, tlbie;
-    logic        ld, st, ld_sext, ld_brev;
-    logic [4:0]  wa_idx, ms_reg_n, ms_cur;
+    logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, ms_ruse, resv_set, resv_clr;
+    logic [5:0]  wa_idx, ms_ridx;
+    logic [6:0]  ms_reg_n;
+    logic [1:0]  ld_pos, fsize;
     logic [9:0]  spr_idx;
     logic [3:0]  sr_idx;
     logic [1:0]  msize;
@@ -99,8 +103,8 @@ module ppc_core #(
 
     ppc_exec #(.PVR(PVR)) u_exec (
         .insn, .pc,
-        .va(gpr[insn[20:16]]), .vb(gpr[insn[15:11]]), .vs(gpr[insn[25:21]]), .v_ms(gpr[ms_cur]),
-        .ms_active, .ms_reg,
+        .va(gpr[insn[20:16]]), .vb(gpr[insn[15:11]]), .vs(gpr[insn[25:21]]), .v_ms(gpr[ms_ridx]),
+        .ms_active, .ms_reg, .resv, .resv_addr,
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
@@ -110,11 +114,12 @@ module ppc_core #(
         .msr_n, .srr_we, .srr0_n, .srr1_n, .exc, .int_ack_dec,
         .next_pc, .wa_en, .wa_idx, .wa_val, .wb_en, .wb_val,
         .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val,
-        .retire, .ms_active_n, .ms_reg_n, .ms_cur,
-        .ld, .st, .ld_sext, .ld_brev, .msize, .ea, .st_data
+        .retire, .ms_active_n, .ms_reg_n, .ms_ridx, .ms_ruse,
+        .ld, .st, .ld_sext, .ld_brev, .ld_mrg, .ld_pos, .ld_acc, .fsize, .resv_set, .resv_clr,
+        .msize, .ea, .st_data
     );
 
-    wire [31:0] ld_val = ppc_pkg::ld_format(dmem_rdata, msize, ld_sext, ld_brev);
+    wire [31:0] ld_val = ppc_pkg::ld_result(dmem_rdata, fsize, ld_sext, ld_brev, ld_mrg, ld_pos, ld_acc, wa_val);
     wire        rf_we  = wa_en | ld;
     wire [31:0] rf_val = ld ? ld_val : wa_val;
     wire [31:0] dec_n  = (spr_we && commit && spr_idx == 10'd22) ? spr_val : dec_r - 32'd1;
@@ -130,7 +135,7 @@ module ppc_core #(
     assign tr_valid   = step;
     assign tr_pc      = pc;
     assign tr_insn    = insn;
-    assign tr_rf_we   = rf_we & ~dsi;  assign tr_rf_idx = wa_idx;      assign tr_rf_val = rf_val;
+    assign tr_rf_we   = rf_we & ~dsi & ~wa_idx[5];  assign tr_rf_idx = wa_idx[4:0];      assign tr_rf_val = rf_val;
     assign tr_up_we   = wb_en & ~dsi;  assign tr_up_idx = insn[20:16]; assign tr_up_val = wb_val;
     assign tr_cr  = dsi ? cr  : cr_n;  assign tr_xer = dsi ? xer : xer_n;
     assign tr_lr  = dsi ? lr  : lr_n;  assign tr_ctr = dsi ? ctr : ctr_n;
@@ -144,7 +149,8 @@ module ppc_core #(
             cr <= 0; xer <= 0; lr <= 0; ctr <= 0; msr <= 0;
             srr0 <= 0; srr1 <= 0; dec_r <= 32'hFFFF_FFFF; hid0 <= 0; hid1 <= 0;
             for (int i = 0; i < 4; i++) sprg[i] <= 0;
-            for (int i = 0; i < 32; i++) gpr[i] <= 0;
+            for (int i = 0; i < 33; i++) gpr[i] <= 0;
+            resv <= 0; resv_addr <= 0;
             tb <= 0; dec_pend <= 0;
             ms_active <= 0; ms_reg <= 0;
             nf_i <= 0; nf_d <= 0;
@@ -185,6 +191,8 @@ module ppc_core #(
                 endcase
                 if (srr_we) begin srr0 <= srr0_n; srr1 <= srr1_n; end
                 ms_active <= ms_active_n; ms_reg <= ms_reg_n;
+                if (resv_set) begin resv <= 1; resv_addr <= ea; end
+                if (resv_clr) resv <= 0;
                 if (retire && !exc) instret <= instret + 64'd1;
             end
         end

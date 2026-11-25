@@ -64,7 +64,7 @@ module ppc_pipe #(
     // ------------------------------------------------------------------
     // Architectural state
     // ------------------------------------------------------------------
-    logic [31:0] gpr [32];
+    logic [31:0] gpr [33];          // [32] = hidden temporary for page-crossing loads
     logic [31:0] cr, xer, lr, ctr, msr, srr0, srr1, dec_r, hid0, hid1;
     logic [31:0] sprg [4];
     logic [63:0] tb;
@@ -80,12 +80,14 @@ module ppc_pipe #(
     logic        e_imiss, e_iflt; logic [31:0] e_ifbits;
     logic        e_nf_i, e_nf_d;                                  // walker found no PTE
     logic [31:0] e_pred_pc;                                       // predicted next PC
-    logic        e_ms_active; logic [4:0] e_ms_reg;               // lmw/stmw sequencer
+    logic        e_ms_active; logic [6:0] e_ms_reg;               // multi-step sequencer
+    logic        resv;        logic [31:0] resv_addr;             // lwarx reservation
 
     typedef struct packed {
         logic        valid;
         logic [31:0] pc, insn;
-        logic        rf_we, ld;  logic [4:0] rf_idx; logic [31:0] rf_val;
+        logic        rf_we, ld;  logic [5:0] rf_idx; logic [31:0] rf_val;
+        logic        mrg, acc;   logic [1:0] pos, fsize;
         logic        up_we;      logic [4:0] up_idx; logic [31:0] up_val;
         logic        st;         logic [31:0] ea, pa, st_data;
         logic [1:0]  size;       logic sext, brev;
@@ -140,20 +142,21 @@ module ppc_pipe #(
     wire [4:0] e_rb   = e_insn[15:11];
     wire [9:0] e_xo10 = e_insn[10:1];
     wire [8:0] e_xo9  = e_insn[9:1];
-    wire [4:0] e_ms_cur = e_ms_active ? e_ms_reg : e_rs;
 
-    function automatic logic [31:0] fwd(input logic [4:0] idx);
+    function automatic logic [31:0] fwd(input logic [5:0] idx);
         if      (m.valid && m.rf_we && !m.ld && m.rf_idx == idx) fwd = m.rf_val;
-        else if (m.valid && m.up_we && m.up_idx == idx)          fwd = m.up_val;
+        else if (m.valid && m.up_we && {1'b0, m.up_idx} == idx)  fwd = m.up_val;
         else if (w.valid && w.rf_we && w.rf_idx == idx)          fwd = w.rf_val;
-        else if (w.valid && w.up_we && w.up_idx == idx)          fwd = w.up_val;
+        else if (w.valid && w.up_we && {1'b0, w.up_idx} == idx)  fwd = w.up_val;
         else                                                     fwd = gpr[idx];
     endfunction
 
-    wire [31:0] e_va = fwd(e_ra);
-    wire [31:0] e_vb = fwd(e_rb);
-    wire [31:0] e_vs = fwd(e_rs);
-    wire [31:0] e_vm = fwd(e_ms_cur);
+    logic [5:0] ms_ridx;
+    logic       ms_ruse;
+    wire [31:0] e_va = fwd({1'b0, e_ra});
+    wire [31:0] e_vb = fwd({1'b0, e_rb});
+    wire [31:0] e_vs = fwd({1'b0, e_rs});
+    wire [31:0] e_vm = fwd(ms_ridx);
 
     // Which GPR fields does the EX instruction actually read? (for load-use stalls)
     logic uses_ra, uses_rb, uses_rs;
@@ -183,8 +186,8 @@ module ppc_pipe #(
     end
 
     wire ld_use = e_valid && m.valid && m.ld &&
-                  ((uses_ra && m.rf_idx == e_ra) || (uses_rb && m.rf_idx == e_rb) ||
-                   (uses_rs && m.rf_idx == e_rs) || (e_opcd == 6'd47 && m.rf_idx == e_ms_cur));
+                  ((uses_ra && m.rf_idx == {1'b0, e_ra}) || (uses_rb && m.rf_idx == {1'b0, e_rb}) ||
+                   (uses_rs && m.rf_idx == {1'b0, e_rs}) || (ms_ruse && m.rf_idx == ms_ridx));
 
     // ------------------------------------------------------------------
     // EX: execute
@@ -194,15 +197,17 @@ module ppc_pipe #(
     logic        wa_en, wb_en, spr_we, srr_we, exc, int_ack_dec, retire, ms_active_n;
     logic        take_int, ctx_sync, sr_we, tlbie;
     logic [3:0]  sr_idx;
-    logic        ld, st, ld_sext, ld_brev;
-    logic [4:0]  wa_idx, ms_reg_n, ms_cur_unused;
+    logic        ld, st, ld_sext, ld_brev, ld_mrg, ld_acc, resv_set, resv_clr;
+    logic [5:0]  wa_idx;
+    logic [6:0]  ms_reg_n;
+    logic [1:0]  ld_pos, fsize;
     logic [9:0]  spr_idx;
     logic [1:0]  msize;
 
     ppc_exec #(.PVR(PVR)) u_exec (
         .insn(e_insn), .pc(e_pc),
         .va(e_va), .vb(e_vb), .vs(e_vs), .v_ms(e_vm),
-        .ms_active(e_ms_active), .ms_reg(e_ms_reg),
+        .ms_active(e_ms_active), .ms_reg(e_ms_reg), .resv, .resv_addr,
         .cr, .xer, .lr, .ctr, .msr, .srr0, .srr1, .dec_r, .hid0, .hid1,
         .sprg0(sprg[0]), .sprg1(sprg[1]), .sprg2(sprg[2]), .sprg3(sprg[3]), .tb,
         .int_ext(irq), .int_dec(dec_pend),
@@ -212,8 +217,9 @@ module ppc_pipe #(
         .msr_n, .srr_we, .srr0_n, .srr1_n, .exc, .int_ack_dec,
         .next_pc, .wa_en, .wa_idx, .wa_val, .wb_en, .wb_val,
         .cr_n, .xer_n, .lr_n, .ctr_n, .spr_we, .spr_idx, .spr_val,
-        .retire, .ms_active_n, .ms_reg_n, .ms_cur(ms_cur_unused),
-        .ld, .st, .ld_sext, .ld_brev, .msize, .ea, .st_data
+        .retire, .ms_active_n, .ms_reg_n, .ms_ridx, .ms_ruse,
+        .ld, .st, .ld_sext, .ld_brev, .ld_mrg, .ld_pos, .ld_acc, .fsize, .resv_set, .resv_clr,
+        .msize, .ea, .st_data
     );
 
     wire e_iwalk   = e_imiss & ~e_nf_i & ~take_int;
@@ -259,14 +265,14 @@ module ppc_pipe #(
     assign dmem_we    = wk_busy ? wk_we    : m.valid && m.st;
     assign dmem_wdata = wk_busy ? wk_wdata : m.st_data;
 
-    wire [31:0] m_ld_val = ppc_pkg::ld_format(dmem_rdata, m.size, m.sext, m.brev);
+    wire [31:0] m_ld_val = ppc_pkg::ld_result(dmem_rdata, m.fsize, m.sext, m.brev, m.mrg, m.pos, m.acc, m.rf_val);
 
     // ------------------------------------------------------------------
     // WB / trace
     // ------------------------------------------------------------------
     assign tr_valid  = w.valid;
     assign tr_pc     = w.pc;      assign tr_insn   = w.insn;
-    assign tr_rf_we  = w.rf_we;   assign tr_rf_idx = w.rf_idx;  assign tr_rf_val = w.rf_val;
+    assign tr_rf_we  = w.rf_we & ~w.rf_idx[5];   assign tr_rf_idx = w.rf_idx[4:0];  assign tr_rf_val = w.rf_val;
     assign tr_up_we  = w.up_we;   assign tr_up_idx = w.up_idx;  assign tr_up_val = w.up_val;
     assign tr_cr = w.cr; assign tr_xer = w.xer; assign tr_lr = w.lr; assign tr_ctr = w.ctr;
     assign tr_msr = w.msr; assign tr_exc = w.exc;
@@ -286,7 +292,8 @@ module ppc_pipe #(
             cr <= 0; xer <= 0; lr <= 0; ctr <= 0; msr <= 0;
             srr0 <= 0; srr1 <= 0; dec_r <= 32'hFFFF_FFFF; hid0 <= 0; hid1 <= 0;
             for (int i = 0; i < 4; i++) sprg[i] <= 0;
-            for (int i = 0; i < 32; i++) gpr[i] <= 0;
+            for (int i = 0; i < 33; i++) gpr[i] <= 0;
+            resv <= 0; resv_addr <= 0;
             tb <= 0; dec_pend <= 0;
             instret <= 0; cycles <= 0; stall_ld_use <= 0; flush_branch <= 0;
         end else begin
@@ -313,6 +320,7 @@ module ppc_pipe #(
             m.up_we   <= wb_en & ~dsi;  m.up_idx <= e_ra;    m.up_val <= wb_val;
             m.st      <= st & ~dsi;  m.ea     <= ea;      m.pa <= d_pa;  m.st_data <= st_data;
             m.size    <= msize;      m.sext   <= ld_sext; m.brev    <= ld_brev;
+            m.mrg     <= ld_mrg;     m.pos    <= ld_pos;  m.acc     <= ld_acc;   m.fsize <= fsize;
             m.retire  <= retire;
             m.cr  <= dsi ? cr  : cr_n;   m.xer <= dsi ? xer : xer_n;
             m.lr  <= dsi ? lr  : lr_n;   m.ctr <= dsi ? ctr : ctr_n;
@@ -349,6 +357,8 @@ module ppc_pipe #(
                 if (srr_we) begin srr0 <= srr0_n; srr1 <= srr1_n; end
                 e_ms_active <= ms_active_n;
                 e_ms_reg    <= ms_reg_n;
+                if (resv_set) begin resv <= 1; resv_addr <= ea; end
+                if (resv_clr) resv <= 0;
             end
 
             // ---- front end ----

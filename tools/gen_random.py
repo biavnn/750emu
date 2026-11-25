@@ -3,8 +3,9 @@
 
 Emits an assembly function `unsigned rnd_test(unsigned *out)` containing a
 random mix of integer instructions (arithmetic with all OE/Rc variants,
-logical, rotates, shifts, compares, CR ops, XER/LR/CTR moves, loads and
-stores to a scratch buffer, forward conditional branches). Architectural
+logical, rotates, shifts, compares, CR ops, XER/LR/CTR moves, aligned and
+unaligned loads and stores to a scratch buffer, string ops, dcbz,
+lwarx/stwcx., forward conditional branches). Architectural
 state is dumped to out[] at regular intervals. Nothing address-dependent is
 ever observed, so the bare-metal build and the QEMU Linux build must agree.
 
@@ -134,6 +135,23 @@ def gen_one(pending):
             emit(f"    mtctr {reg()}")
         else:
             emit(f"    mfctr {reg()}")
+    elif k < 0.90:
+        # string ops, dcbz, lwarx/stwcx. on the scratch buffer
+        c = R.random()
+        if c < 0.55:
+            n = R.randrange(1, 17)
+            rt = R.randrange(3, 9)                       # rt..rt+3 stay inside r3..r11
+            emit(f"    addi r28, r31, {R.randrange(BUF - n + 1)}")
+            emit(f"    {R.choice(['lswi', 'stswi'])} r{rt}, r28, {n}")
+        elif c < 0.7:
+            emit(f"    li r29, {R.randrange(BUF)}")
+            emit("    dcbz r31, r29")
+        else:
+            emit(f"    li r29, {4 * R.randrange(BUF // 4)}")
+            emit(f"    lwarx {reg()}, r31, r29")
+            emit(f"    stwcx. {reg()}, r31, r29")
+            if R.random() < 0.3:
+                emit(f"    stwcx. {reg()}, r31, r29")       # no reservation left: must fail
     elif k < 0.96:
         c = R.random()
         if c < 0.5:
@@ -211,7 +229,7 @@ def main():
     emit("    lwz r3, 8(r1)\n    subf r3, r3, r30")
     emit("    lmw r14, 16(r1)\n    lwz r12, 88(r1)\n    mtcrf 0xff, r12")
     emit("    lwz r0, 100(r1)\n    mtlr r0\n    addi r1, r1, 96\n    blr")
-    emit("    .bss\n    .align 4\nrnd_buf: .space %d" % BUF)
+    emit("    .bss\n    .align 5\nrnd_buf: .space %d" % BUF)
     emit('    .section .note.GNU-stack,"",@progbits')
     open(path, "w").write("\n".join(lines) + "\n")
 

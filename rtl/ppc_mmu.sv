@@ -65,6 +65,32 @@ module ppc_mmu #(
     logic [31:0] sr [16];
     logic [31:0] sdr1, dsisr, dar;
 
+    // 750 registers with no function in this design yet (cache/thermal/
+    // breakpoint/performance-monitor control): plain storage so software that
+    // saves and restores them works.
+    logic [31:0] misc [16];
+    function automatic logic [4:0] misc_slot(input logic [9:0] n);   // bit 4 = valid
+        case (n)
+            10'd1017: misc_slot = 5'h10;  // L2CR
+            10'd1019: misc_slot = 5'h11;  // ICTC
+            10'd1020: misc_slot = 5'h12;  // THRM1
+            10'd1021: misc_slot = 5'h13;  // THRM2
+            10'd1022: misc_slot = 5'h14;  // THRM3
+            10'd1010: misc_slot = 5'h15;  // IABR
+            10'd1013: misc_slot = 5'h16;  // DABR
+            10'd952:  misc_slot = 5'h17;  // MMCR0
+            10'd956:  misc_slot = 5'h18;  // MMCR1
+            10'd953:  misc_slot = 5'h19;  // PMC1
+            10'd954:  misc_slot = 5'h1A;  // PMC2
+            10'd957:  misc_slot = 5'h1B;  // PMC3
+            10'd958:  misc_slot = 5'h1C;  // PMC4
+            10'd955:  misc_slot = 5'h1D;  // SIA
+            10'd282:  misc_slot = 5'h1E;  // EAR
+            default:  misc_slot = 5'h00;
+        endcase
+    endfunction
+    wire [4:0] ms_slot = misc_slot(spr_idx);
+
     typedef struct packed {
         logic [23:0]     vsid;
         logic [TAGW-1:0] tag;
@@ -180,7 +206,7 @@ module ppc_mmu #(
             10'd25: spr_rdata = sdr1;
             [10'd528:10'd535]: spr_rdata = spr_idx[0] ? ibatl[bn] : ibatu[bn];
             [10'd536:10'd543]: spr_rdata = spr_idx[0] ? dbatl[bn] : dbatu[bn];
-            default: spr_rvalid = 1'b0;
+            default: if (ms_slot[4]) spr_rdata = misc[ms_slot[3:0]]; else spr_rvalid = 1'b0;
         endcase
     end
     assign sr_rdata = sr[sr_idx];
@@ -190,7 +216,7 @@ module ppc_mmu #(
             for (int i = 0; i < 4; i++) begin
                 ibatu[i] <= 0; ibatl[i] <= 0; dbatu[i] <= 0; dbatl[i] <= 0;
             end
-            for (int i = 0; i < 16; i++) sr[i] <= 0;
+            for (int i = 0; i < 16; i++) begin sr[i] <= 0; misc[i] <= 0; end
             sdr1 <= 0; dsisr <= 0; dar <= 0;
             itlb_v <= '0; dtlb_v <= '0;
             ws <= W_IDLE; w_ea <= 0; w_instr <= 0; w_store <= 0; w_sec <= 0; w_idx <= 0;
@@ -201,7 +227,7 @@ module ppc_mmu #(
                 10'd25: begin sdr1 <= spr_wdata; itlb_v <= '0; dtlb_v <= '0; end
                 [10'd528:10'd535]: if (spr_idx[0]) ibatl[bn] <= spr_wdata; else ibatu[bn] <= spr_wdata;
                 [10'd536:10'd543]: if (spr_idx[0]) dbatl[bn] <= spr_wdata; else dbatu[bn] <= spr_wdata;
-                default: ;
+                default: if (ms_slot[4]) misc[ms_slot[3:0]] <= spr_wdata;
             endcase
             if (sr_we) sr[sr_idx] <= sr_wdata;
             if (dsi_we) begin dsisr <= dsisr_in; dar <= dar_in; end

@@ -4,7 +4,7 @@ An open 32-bit PowerPC core (G3/750-class), with the long-term goal of booting
 classic Mac OS 9 on an FPGA. The design target is "what Mac OS accepts as a G3",
 not a clone of the real 750's out-of-order microarchitecture.
 
-## Status: phase 2b in progress (exceptions and MMU done; Linux boot next)
+## Status: phase 2b in progress (integer ISA, exceptions and MMU done; Linux boot next)
 
 Two cores share one execute unit (`rtl/ppc_exec.sv`), so they implement
 identical instruction semantics:
@@ -21,13 +21,14 @@ Verification, all passing:
 |---|---|
 | `make test` | both cores vs QEMU (`qemu-ppc -cpu 750`) on the C/asm test programs, then pipeline vs reference in lockstep |
 | `make test` (supervisor part) | bare-metal exception tests on both cores vs full-system QEMU (`qemu-system-ppc -M 40p -cpu 750`), plus lockstep |
-| `make randtest` | random instruction programs: pipeline vs QEMU output, plus lockstep vs reference. 190 seeds x 2,000 instructions pass |
+| `make randtest` | random instruction programs (now including string ops, `dcbz`, `lwarx`/`stwcx.`): pipeline vs QEMU output, plus lockstep vs reference. 230 seeds x 2,000 instructions pass |
 
 Supervisor tests (`sw/sys/`): `exc` (every exception type, user mode), `irq`
 (decrementer interrupts at pseudo-random points under load), `mmu` (BATs, page
 table, R/C bits, protection, faults, tlbie, segment switch), `vm` (all code and
 data through the page table via two aliased mappings that keep evicting each
-other from the TLBs, with interrupts).
+other from the TLBs, with interrupts), `insn` (atomics, `dcbz`, string ops,
+page-crossing loads and stores including a missing second page).
 
 The lockstep checker compares every retired step (PC, instruction, register
 writes, CR/XER/LR/CTR, store address/data) and prints the first divergence with
@@ -48,7 +49,14 @@ forms), multiply/divide, logical, shifts, rotates, `cntlzw`, `extsb`/`extsh`,
 compares, all CR ops, `mcrf`, `mfcr`/`mtcrf`, `mcrxr`, all branch forms,
 byte/half/word loads and stores (algebraic, update, indexed, byte-reversed),
 `lmw`/`stmw`, `mfspr`/`mtspr` (XER, LR, CTR, SRR0/1, SPRG0-3, DEC, TB, PVR, HID0/1),
-`mfmsr`/`mtmsr`, `mftb`.
+`mfmsr`/`mtmsr`, `mftb`, `lwarx`/`stwcx.`, `dcbz` (32-byte blocks), string ops
+(`lswi`/`lswx`/`stswi`/`stswx`), and storage-only versions of the 750's cache,
+thermal, breakpoint and performance-monitor registers.
+
+Multi-step instructions (`lmw`/`stmw`, `dcbz`, string ops) run on a small
+sequencer in the execute unit, one memory access per step. The same sequencer
+splits an ordinary unaligned load or store that straddles a page boundary into
+byte steps, so each page is translated and can fault on its own.
 
 Exception model (both cores, precise):
 - MSR (EE, PR, FP, ME, FE0/1, SE, BE, IP, IR, DR, RI stored; EE, PR, FP, IP acted on), SRR0/SRR1, `rfi`, `sc`, `tw`/`twi`
@@ -77,15 +85,17 @@ MMU (`rtl/ppc_mmu.sv`, shared by both cores):
   resolved non-speculatively in EX; data addresses translate in EX; instructions
   that change the translation context flush younger fetches
 
-MMU limitations: an access crossing a page boundary is translated by its first
-byte only; direct-store segments fault; a faulting `stmw`/`lmw` may have
-completed part of its work (allowed by the architecture; QEMU completes none).
+MMU limitations: a misaligned `lmw`/`stmw` word that crosses a page boundary is
+translated by its first byte only; direct-store segments fault; a faulting
+multi-step instruction or page-crossing store may have completed part of its
+work (allowed by the architecture; QEMU completes none). `stwcx.` succeeds only
+at the address of the preceding `lwarx` (a real 750 checks just the reservation
+flag); exceptions do not clear the reservation.
 QEMU also lets code execute from a page with no read access (key=1, PP=00);
 g3core raises ISI as real hardware does.
 
 Not yet implemented: FPU (FP instructions raise FP-unavailable or program
-exceptions), machine check, trace/single-step, string ops, `lwarx`/`stwcx.`,
-`dcbz` (these raise a program exception).
+exceptions), machine check, trace/single-step, alignment exception.
 
 ## Layout
 
@@ -137,22 +147,22 @@ test passes when both produce identical output and exit codes.
 | **0** (done) | Single-cycle integer reference core, differential tests vs QEMU |
 | **1** (done) | 5-stage in-order pipeline, forwarding, load-use interlock, static branch prediction, lockstep + random testing |
 | **2a** (done) | Exceptions: MSR, `sc`/`rfi`, program/trap/privilege, FP unavailable, decrementer + external interrupt, user mode |
-| **2b** (MMU done) | BATs, segments, hardware page table walk, TLBs, DSI/ISI. Remaining: `lwarx`/`stwcx.`, `dcbz`, string ops, then boot 32-bit Linux |
+| **2b** (CPU side done) | BATs, segments, hardware page table walk, TLBs, DSI/ISI, atomics, `dcbz`, string ops, page-crossing accesses. Remaining: boot 32-bit Linux |
 | 3 | FPU: IEEE double, fused multiply-add, FPSCR; pass IEEE test vectors |
 | 4 | Caches, DDR3 (LiteDRAM), FPGA bring-up on Artix-7 |
 | 5 | mac99-style platform (OpenPIC, MacIO/KeyLargo subset, framebuffer + NDRV), OpenBIOS, Mac OS 9 |
 
 ## Next steps (rest of phase 2b: Linux)
 
-1. Remaining integer instructions Linux needs: `lwarx`/`stwcx.`, `dcbz`,
-   `lswi`/`lswx`/`stswi`/`stswx`, `eciwx`-class no-ops, `mfspr`/`mtspr` for the
-   750's remaining SPRs (L2CR, ICTC, THRM, IABR, DABR, performance monitor) as
-   stubs, alignment exception or full unaligned support across pages.
-2. A minimal Linux platform in simulation: more RAM (sparse model in the
-   testbench), UART (16550-compatible so stock drivers work), device tree,
-   a small boot wrapper; faster simulation (Verilator threads, `-O3` tuning).
-3. Boot a 32-bit PowerPC kernel with an initramfs to a shell; compare the
-   early boot trace against QEMU where practical.
+1. A minimal Linux platform in simulation: more RAM (the 1 MiB byte array
+   becomes a larger word-addressed or sparse model), a 16550-compatible UART so
+   the stock serial driver works, a flattened device tree, a small boot wrapper.
+2. Build a small 32-bit PowerPC kernel (hash MMU, no FPU use in kernel, math
+   emulation on) with an initramfs and boot it to a shell. Expect to find gaps:
+   any instruction or SPR the kernel touches that is still missing will show
+   up as a program exception with the instruction word in the log.
+3. Simulation speed for the boot: Verilator threads and tuning, or an
+   instruction-skipping fast-forward checked against QEMU.
 4. FPU (phase 3) can start in parallel: the kernel can run with FP emulation.
 5. Performance: branch target buffer, synchronous (BRAM-style) memories, caches,
    2-way TLBs.
