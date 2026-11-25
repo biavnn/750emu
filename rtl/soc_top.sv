@@ -5,7 +5,9 @@
 // Accesses outside RAM/MMIO raise bus_err.
 
 module soc_top #(
-    parameter int MEM_BYTES = 1 << 20
+    parameter int MEM_BYTES = 1 << 20,
+    parameter int CORE      = 1,     // 0 = single-cycle reference, 1 = pipeline
+    parameter bit QUIET     = 0      // suppress UART output (second core in lockstep)
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -16,7 +18,17 @@ module soc_top #(
     output logic [31:0] trap_insn,
     output logic        bus_err,
     output logic [31:0] bus_err_addr,
-    output logic [63:0] instret
+    output logic [63:0] instret,
+    output logic [63:0] cycles,
+    output logic [63:0] stall_ld_use,
+    output logic [63:0] flush_branch,
+    output logic        tr_valid,
+    output logic [31:0] tr_pc, tr_insn,
+    output logic        tr_rf_we,  output logic [4:0] tr_rf_idx, output logic [31:0] tr_rf_val,
+    output logic        tr_up_we,  output logic [4:0] tr_up_idx, output logic [31:0] tr_up_val,
+    output logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr,
+    output logic        tr_st,     output logic [31:0] tr_st_addr, tr_st_data,
+    output logic [1:0]  tr_st_size
 );
     localparam int AW = $clog2(MEM_BYTES);
 
@@ -33,12 +45,30 @@ module soc_top #(
     logic [1:0]  dmem_size;
     logic        dmem_re, dmem_we;
 
-    ppc_core u_core (
-        .clk, .rst,
-        .imem_addr, .imem_rdata,
-        .dmem_addr, .dmem_size, .dmem_re, .dmem_we, .dmem_wdata, .dmem_rdata,
-        .trap, .trap_pc, .trap_insn, .instret
-    );
+    generate if (CORE == 0) begin : g_core
+        ppc_core u_core (
+            .clk, .rst,
+            .imem_addr, .imem_rdata,
+            .dmem_addr, .dmem_size, .dmem_re, .dmem_we, .dmem_wdata, .dmem_rdata,
+            .trap, .trap_pc, .trap_insn, .instret, .cycles,
+            .tr_valid, .tr_pc, .tr_insn, .tr_rf_we, .tr_rf_idx, .tr_rf_val,
+            .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr,
+            .tr_st, .tr_st_addr, .tr_st_data, .tr_st_size
+        );
+        assign stall_ld_use = 0;
+        assign flush_branch = 0;
+    end else begin : g_pipe
+        ppc_pipe u_core (
+            .clk, .rst,
+            .imem_addr, .imem_rdata,
+            .dmem_addr, .dmem_size, .dmem_re, .dmem_we, .dmem_wdata, .dmem_rdata,
+            .trap, .trap_pc, .trap_insn, .instret, .cycles,
+            .tr_valid, .tr_pc, .tr_insn, .tr_rf_we, .tr_rf_idx, .tr_rf_val,
+            .tr_up_we, .tr_up_idx, .tr_up_val, .tr_cr, .tr_xer, .tr_lr, .tr_ctr,
+            .tr_st, .tr_st_addr, .tr_st_data, .tr_st_size,
+            .stall_ld_use, .flush_branch
+        );
+    end endgenerate
 
     function automatic logic [7:0] rd8(input logic [31:0] a);
         rd8 = mem[a[AW-1:0]];
@@ -69,7 +99,7 @@ module soc_top #(
             end
             if (dmem_we && is_mmio) begin
                 case (dmem_addr[7:0])
-                    8'h00: begin $write("%c", dmem_wdata[7:0]); $fflush; end
+                    8'h00: if (!QUIET) begin $write("%c", dmem_wdata[7:0]); $fflush; end
                     8'h04: begin done <= 1; exit_code <= dmem_wdata; end
                     default: ;
                 endcase

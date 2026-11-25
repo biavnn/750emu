@@ -46,8 +46,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "TIMEOUT after %llu cycles\n", (unsigned long long)cyc);
         rc = 102;
     }
-    fprintf(stderr, "cycles=%llu instret=%llu (%.1f M cycles/s sim)\n",
-            (unsigned long long)cyc, (unsigned long long)top->instret,
+    double cpi = top->instret ? (double)top->cycles / top->instret : 0.0;
+    fprintf(stderr, "cycles=%llu instret=%llu CPI=%.3f ld_use_stalls=%llu branch_flushes=%llu (%.1f M cycles/s sim)\n",
+            (unsigned long long)top->cycles, (unsigned long long)top->instret, cpi,
+            (unsigned long long)top->stall_ld_use, (unsigned long long)top->flush_branch,
             secs > 0 ? cyc / secs / 1e6 : 0.0);
 
     top->final();

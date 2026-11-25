@@ -1,7 +1,7 @@
 # g3core top-level build
 #   make            build simulator + all tests
 #   make test       run differential tests (sim vs qemu-ppc -cpu 750)
-#   make run T=hello  run one test on the simulator
+#   make run T=hello  run one test on the pipeline simulator
 
 CROSS   ?= powerpc-linux-gnu-
 CC      := $(CROSS)gcc
@@ -17,20 +17,35 @@ CFLAGS_BARE   := $(CFLAGS_COMMON) -ffreestanding -fno-builtin -msdata=none -G 0
 LDFLAGS_BARE  := -Wl,--build-id=none -nostdlib -nostartfiles -static -no-pie -T sw/common/link.ld
 CFLAGS_LINUX  := $(CFLAGS_COMMON) -static -no-pie
 
-RTL := rtl/ppc_core.sv rtl/soc_top.sv
-SIM := $(BUILD)/sim/Vsoc_top
+RTL := rtl/ppc_pkg.sv rtl/ppc_exec.sv rtl/ppc_core.sv rtl/ppc_pipe.sv rtl/soc_top.sv
 
-.PHONY: all sim tests test run clean
+.PHONY: all sim tests test run clean randtest
 .SECONDARY:
 all: sim tests
 
-# ---------------- simulator ----------------
-sim: $(SIM)
-$(SIM): $(RTL) sim/tb.cpp
-	verilator --cc --exe --build -j 0 -O3 -Wall -Wno-fatal --top-module soc_top \
-	    -Mdir $(BUILD)/sim -o Vsoc_top $(abspath $(RTL) sim/tb.cpp) >$(BUILD)/verilator.log 2>&1 \
-	    || (cat $(BUILD)/verilator.log; false)
-	@grep -E '%Warning' $(BUILD)/verilator.log || true
+# ---------------- simulators ----------------
+#   build/sim0/Vsoc_top   single-cycle reference core
+#   build/sim1/Vsoc_top   pipeline
+#   build/ls/Vlockstep    both, trace-compared
+VFLAGS := --cc --exe --build -j 0 -O3 -fno-case -Wall -Wno-fatal
+SIM0 := $(BUILD)/sim0/Vsoc_top
+SIM1 := $(BUILD)/sim1/Vsoc_top
+LS   := $(BUILD)/ls/Vlockstep_top
+sim: $(SIM0) $(SIM1) $(LS)
+
+define verilate
+	@mkdir -p $(dir $@)
+	verilator $(VFLAGS) --top-module $(1) $(2) -Mdir $(dir $@) -o $(notdir $@) \
+	    $(abspath $(RTL) $(3)) >$(dir $@)/verilator.log 2>&1 || (cat $(dir $@)/verilator.log; false)
+	@grep -E '%Warning' $(dir $@)/verilator.log || true
+endef
+
+$(SIM0): $(RTL) sim/tb.cpp
+	$(call verilate,soc_top,-GCORE=0,sim/tb.cpp)
+$(SIM1): $(RTL) sim/tb.cpp
+	$(call verilate,soc_top,-GCORE=1,sim/tb.cpp)
+$(LS): $(RTL) rtl/lockstep_top.sv sim/tb_lockstep.cpp
+	$(call verilate,lockstep_top,,rtl/lockstep_top.sv sim/tb_lockstep.cpp)
 
 # ---------------- software ----------------
 tests: $(foreach t,$(TESTS),$(BUILD)/sw/$(t).hex $(BUILD)/sw/$(t).linux)
@@ -53,11 +68,21 @@ $(BUILD)/sw/%.linux: sw/tests/%.c $(COMMON_LINUX) sw/common/tlib.h
 	$(CC) $(CFLAGS_LINUX) -o $@ $(COMMON_LINUX) $< $(call extra_src,$*)
 
 # ---------------- running ----------------
-run: $(SIM) $(BUILD)/sw/$(T).hex
-	$(SIM) +img=$(BUILD)/sw/$(T).hex
+run: $(SIM1) $(BUILD)/sw/$(T).hex
+	$(SIM1) +img=$(BUILD)/sw/$(T).hex
 
+# Differential tests vs QEMU for both cores, then lockstep (pipeline vs reference)
 test: all
-	@tools/difftest.sh $(SIM) $(BUILD)/sw "$(QEMU)" $(TESTS)
+	@echo "== reference core vs QEMU"; tools/difftest.sh $(SIM0) $(BUILD)/sw "$(QEMU)" $(TESTS)
+	@echo "== pipeline vs QEMU";       tools/difftest.sh $(SIM1) $(BUILD)/sw "$(QEMU)" $(TESTS)
+	@echo "== lockstep pipeline vs reference"; tools/lockstep.sh $(LS) $(BUILD)/sw $(TESTS)
 
 clean:
 	rm -rf $(BUILD)
+
+# Random instruction tests: make randtest [SEED=1] [N=50] [LEN=2000]
+SEED ?= 1
+N    ?= 50
+LEN  ?= 2000
+randtest: sim
+	tools/randtest.sh $(SEED) $(N) $(LEN)
